@@ -50,7 +50,7 @@ class Updater:
             raise ValueError("Expected model.init to return a dict with "
                 f"a single key 'params'. Instead got {v.keys()}.")
         return TrainState(
-            step=0,
+            step=1,
             rng=out_rng,
             opt_state=opt_state,
             params=v["params"],

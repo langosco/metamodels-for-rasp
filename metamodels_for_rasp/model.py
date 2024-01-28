@@ -101,7 +101,7 @@ class AddPositionEmbs(nn.Module):
     return inputs + pe
 
 
-class MlpBlock(nn.Module):
+class MLPBlock(nn.Module):
   """Transformer MLP / feed-forward block.
 
   Attributes:
@@ -114,7 +114,6 @@ class MlpBlock(nn.Module):
 
   @nn.compact
   def __call__(self, inputs, deterministic=True):
-    """Applies Transformer MlpBlock module."""
     config = self.config
     actual_out_dim = inputs.shape[-1] if self.out_dim is None else self.out_dim
     x = nn.Dense(
@@ -158,6 +157,8 @@ class Encoder1DBlock(nn.Module):
       output after transformer encoder block.
     """
     config = self.config
+    causal_mask = jnp.tril(jnp.ones((1, 1, inputs.shape[1], inputs.shape[1])))
+
 
     # Attention block.
     assert inputs.ndim == 3
@@ -172,14 +173,14 @@ class Encoder1DBlock(nn.Module):
         broadcast_dropout=False,
         dropout_rate=config.attention_dropout_rate,
         deterministic=deterministic,
-    )(x)
+    )(x, mask=causal_mask)
 
     x = nn.Dropout(rate=config.dropout_rate)(x, deterministic=deterministic)
     x = x + inputs
 
     # MLP block.
     y = nn.LayerNorm(dtype=config.dtype)(x)
-    y = MlpBlock(config=config)(y, deterministic=deterministic)
+    y = MLPBlock(config=config)(y, deterministic=deterministic)
     return x + y
 
 
