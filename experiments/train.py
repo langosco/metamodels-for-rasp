@@ -17,21 +17,24 @@ import orbax.checkpoint
 from etils import epath
 from tqdm import tqdm
 from jax.typing import ArrayLike
+from flax import linen as nn
 
 from nn_utils import schedules
 from metamodels_for_rasp import on_cluster, output_dir, interactive
 from metamodels_for_rasp.train import Updater, Logger
-from metamodels_for_rasp.logger_config import setup_logger
+from metamodels_for_rasp.logger_config import setup_logger, setup_data_logger
 from metamodels_for_rasp.model import Transformer, TransformerConfig
-from metamodels_for_rasp.utils import count_params, data_iterator
+from metamodels_for_rasp.utils import count_params, data_iterator, color_sequence
 
 from rasp_tokenizer import paths
 from rasp_tokenizer import vocab
-from rasp_tokenizer.data_utils import load_data, process_data, split_dict_data
+from rasp_tokenizer.data_utils import load_and_process_data, split_dict_data
 from rasp_tokenizer import MAX_RASP_LENGTH, MAX_WEIGHTS_LENGTH
+from rasp_tokenizer import tokenizer
 
 
 logger = setup_logger(__name__)
+data_logger = setup_data_logger()
 START_TIME = time()
 VAL_DATA_RATIO = 0.1
 
@@ -54,7 +57,7 @@ def create_loss_fn(model_forward: callable):
             is_training: bool = True,
     ) -> (float, dict):
         """Compute loss for a batch."""
-        tokens = batch['rasp']
+        tokens = batch['rasp_tok']
         loss_mask = get_mask(tokens)
 
         outputs = model_forward(
@@ -93,7 +96,7 @@ def main():
     parser.add_argument('--init_scale', type=float, default=1.0)
 
     # training
-    parser.add_argument('--nsteps', type=int, default=100_000)
+    parser.add_argument('--nsteps', type=int, default=np.inf)
     parser.add_argument('--max_runtime', type=int, help='Max runtime in minutes', default=np.inf)
     parser.add_argument('--max_epochs', type=int, default=10**8)
     parser.add_argument('--save_checkpoint', action='store_true', 
@@ -119,44 +122,56 @@ def main():
     parser.add_argument('--use_wandb', action='store_true')
     parser.add_argument('--tags', nargs='*', type=str, default=[])
     parser.add_argument('--notes', type=str, default=None, help="wandb notes")
+    parser.add_argument('--wandb_run_name', type=str, default=None)
 
     args = parser.parse_args()
 
     args.tags.append("HPC" if on_cluster else "local")
+    if args.wandb_run_name is not None:
+        args.wandb_run_name += str(int(time()))
     logger.info("Args:\n%s", pprint.pformat(vars(args)))
     rng = jax.random.PRNGKey(args.seed)
+    np_rng = np.random.default_rng()
 
     # Data
-    data, test_data = load_data()
-    if len(data) < args.ndata:
-        logger.warning(f"Requested {args.ndata} datapoints, but only "
-                       f"{len(data)} available.")
-    else:
-        data = list(data)[:args.ndata]
-    data = process_data(
-        data=data, 
-        d_model=args.d_model, 
+    data = load_and_process_data(
+        rng=np_rng,
+        ndata=args.ndata,
+        shuffle=True,
+        name="train",
+        d_model=args.d_model,
         max_rasp_len=MAX_RASP_LENGTH,
         max_weights_len=MAX_WEIGHTS_LENGTH,
     )
 
     train_data, val_data = split_dict_data(
         data, val_ratio=VAL_DATA_RATIO)
-    
-    # normalize weights
-    w_mean, w_std = train_data["weights"].mean(), train_data["weights"].std()
-    train_data['weights'] = (train_data['weights'] - w_mean) / w_std
-    val_data['weights'] = (val_data['weights'] - w_mean) / w_std
 
-    # clip again
-#    train_data["weights"] = np.clip(train_data["weights"], -1, 1)
-#    val_data["weights"] = np.clip(val_data["weights"], -1, 1)
+    test_datasets = {
+        name: load_and_process_data(
+            rng=None,
+            ndata=None,
+            shuffle=False,
+            name=name,
+            d_model=args.d_model,
+            max_rasp_len=MAX_RASP_LENGTH,
+            max_weights_len=MAX_WEIGHTS_LENGTH,
+        ) for name in ["test_5"]
+    }
+
+#    # normalize weights
+    w_std = train_data["weights"].std()
+    train_data['weights'] = train_data['weights'] / w_std
+    val_data['weights'] = val_data['weights'] / w_std
+    for v in test_datasets.values():
+        v['weights'] = v['weights'] / w_std
 
 
     args.nsteps = min(args.nsteps, args.max_epochs * args.ndata // args.bs)
     seq_len=MAX_RASP_LENGTH + MAX_WEIGHTS_LENGTH/args.d_model
     assert seq_len.is_integer()
     seq_len = int(seq_len)
+
 
     config = TransformerConfig(
         vocab_size=vocab.size,
@@ -169,11 +184,11 @@ def main():
         max_len=seq_len,
         dropout_rate=args.dropout_rate,
         attention_dropout_rate=args.dropout_rate,
+#        posemb_init=nn.initializers.zeros,
     )
     model = Transformer(config=config)
 
 
-    model_scale = args.d_model / 1024
     @optax.inject_hyperparams
     def optimizer(lr: float, wd: float, clip_value: float) -> optax.GradientTransformation:
         opt = optax.adamw(
@@ -195,28 +210,25 @@ def main():
         cooldown_start=int(args.nsteps*0.75), 
         max_lr=args.lr*4,
     )
-    opt = optimizer(lr=schedule, wd=args.wd, clip_value=1.)
+    opt = optimizer(lr=schedule, wd=args.wd, clip_value=20.)
     loss_fn = create_loss_fn(model.apply)
     updater = Updater(opt=opt, model=model, loss_fn=loss_fn)
     metrics_logger = Logger()
 
+
     dummy_batch = {
         "weights": data['weights'][:1],
-        "rasp": data['rasp'][:1],
+        "rasp_tok": data['rasp_tok'][:1],
     }
     subrng, rng = jax.random.split(rng)
     state = updater.init_train_state(subrng, dummy_batch)
 
-
-    checkpoint_savedir = epath.Path(output_dir) / "mm-checkpoints" \
-        / "decompile"
-    checkpoint_savename = f"run_{int(time())}"
-
-    wandb.init(
+    run = wandb.init(
         mode="online" if args.use_wandb else "disabled",
         project=f"inverse-tracr",
         tags=args.tags,
         notes=args.notes,
+        name=args.wandb_run_name,
         config={
             "lr": args.lr,
             "weight_decay": args.wd,
@@ -233,18 +245,32 @@ def main():
         },
     )  
 
+    checkpoint_savedir = epath.Path(output_dir) / "mm-checkpoints" \
+        / "decompile"
+    if args.use_wandb:
+        checkpoint_savename = run.name
+    else:
+        checkpoint_savename = f"run_{int(time())}"
+
+
     logger.info(f"Tags: {args.tags}")
     logger.info("Number of training examples: "
-                f"{len(train_data['rasp'])}.")
+                f"{len(train_data['rasp_tok'])}.")
     logger.info("Number of validation examples: "
-                f"{len(val_data['rasp'])}.")
+                f"{len(val_data['rasp_tok'])}.")
+    for test_data in test_datasets.values():
+        logger.info("Number of test examples: "
+                    f"{len(test_data['rasp_tok'])}.")
     logger.info(f"Total number of steps: {args.nsteps}")
     logger.info(f"Number of parameters in meta-model: "
                 f"{count_params(state.params) / 1e6} Million")
     logger.info(f"Data shapes: weights: {train_data['weights'].shape}, "
-                f"rasp: {train_data['rasp'].shape}")
+                f"rasp_tok: {train_data['rasp_tok'].shape}")
     logger.info(f"Train data (weights) mean: {train_data['weights'].mean()}, "
                 f"std: {train_data['weights'].std()}")
+    for test_data in test_datasets.values():
+        logger.info(f"Test data (weights) mean: {test_data['weights'].mean()}, "
+                    f"std: {test_data['weights'].std()}")
     logger.info(f"Percent of weights zero: "
                 f"{round(100 * (train_data['weights'] == 0).sum() / train_data['weights'].size, 2)}%")
     logger.info(f"Expected sequence length: {seq_len}.")
@@ -262,7 +288,7 @@ def main():
             ):
             chex.assert_shape(batch["weights"], 
                               (args.bs, MAX_WEIGHTS_LENGTH/args.d_model, args.d_model))
-            chex.assert_shape(batch["rasp"], (args.bs, MAX_RASP_LENGTH)) 
+            chex.assert_shape(batch["rasp_tok"], (args.bs, MAX_RASP_LENGTH)) 
             state, train_metrics = updater.update(state, batch)
             metrics_logger.write(state, train_metrics, name="train")
 
@@ -276,9 +302,16 @@ def main():
                             "training.")
                 stop_training = True
                 break
+            
+            if state.step in [1, 2, 4, 8, 16, 32, 64, 128]:
+                # log more frequently early on
+                metrics_logger.flush_mean(state, name="train",
+                        verbose=disable_tqdm, extra_metrics={"epoch": epoch})
 
-        metrics_logger.flush_mean(state, name="train",
-                verbose=disable_tqdm, extra_metrics={"epoch": epoch})
+        if state.step > 128:
+            # log once per epoch
+            metrics_logger.flush_mean(state, name="train",
+                    verbose=disable_tqdm, extra_metrics={"epoch": epoch})
         return state, stop_training
 
     
@@ -294,29 +327,47 @@ def main():
         return np.mean(full_program_correct)
 
 
-    def validate(state):
+    def log_rasp_snippet(
+            batch: ArrayLike, 
+            correct_preds: ArrayLike, 
+            name: str,
+            snip_at: int = 10,
+            batch_element: int = 0,
+        ):
+        rasp_snippet = tokenizer.decode(batch['rasp_tok'][batch_element, :snip_at])
+        rasp_snippet = color_sequence(rasp_snippet, correct_preds[:snip_at])
+        data_logger.info(f"{name}: {rasp_snippet}")
+
+
+    def compute_metrics(state, data, name="test"):
         program_ids = []
         correct_preds = []
-        for batch in data_iterator(val_data, args.bs, stacked_tree=True):
-            chex.assert_shape(batch["rasp"], (None, MAX_RASP_LENGTH)) 
+        for batch in data_iterator(data, args.bs, stacked_tree=True):
+            chex.assert_shape(batch["rasp_tok"], (None, MAX_RASP_LENGTH)) 
             chex.assert_shape(batch["weights"],
                               (None, MAX_WEIGHTS_LENGTH/args.d_model, args.d_model))
 
             state, val_metrics, aux = updater.compute_val_metrics(
-                state, batch)
-            metrics_logger.write(state, val_metrics, name="val")
+                state, batch, name=name)
+            metrics_logger.write(state, val_metrics, name=name)
 
             mask = np.array(aux['mask'], dtype=bool)
             program_ids += batch['program_id'].flatten().tolist()
             correct_preds += aux['correct_preds'][mask].flatten().tolist()
+        
+        for idx in range(10):
+            log_rasp_snippet(data, correct_preds, name,
+                            snip_at=10,
+                            batch_element=idx)
+        data_logger.info("\n")
 
         metrics_logger.flush_mean(
             state, 
-            name="val", 
+            name=name, 
             verbose=disable_tqdm, 
             extra_metrics={
                 "epoch": epoch,
-                "program_accuracy": get_program_accuracy(program_ids, correct_preds),
+                f"{name}/program_accuracy": get_program_accuracy(program_ids, correct_preds),
             }
         )
             
@@ -328,12 +379,16 @@ def main():
     disable_tqdm = not interactive or args.disable_tqdm
     for epoch in range(args.max_epochs):
         if epoch % args.val_every == 0:
-            state = validate(state)
+            state = compute_metrics(state, val_data, name="val")
+            for name, test_data in test_datasets.items():
+                state = compute_metrics(state, test_data, name=name)
 
         state, stop_training = train(state)
 
         if stop_training:
-            validate(state)
+            state = compute_metrics(state, val_data, name="val")
+            for name, test_data in test_datasets.items():
+                state = compute_metrics(state, test_data, name=name)
             break
     
     logger.info("=======================================")

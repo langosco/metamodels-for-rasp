@@ -200,7 +200,7 @@ class Transformer(nn.Module):
 
     Args:
       input: dict with keys 'program' and 'weights'.
-        'program' is a tokenized RASP program.
+        'rasp_tok' is a tokenized RASP program.
         'weights' is an array of weights from the compiled model.
       inputs: input data
       train: if it is training.
@@ -212,7 +212,7 @@ class Transformer(nn.Module):
     train = is_training
     config = self.config
     weights = inputs["weights"]
-    prog = inputs["rasp"].astype('int32')
+    prog = inputs["rasp_tok"].astype('int32')
     chex.assert_shape(weights, (None, None, config.emb_dim))  # batch, seq, dim
     chex.assert_shape(prog, (None, None))  # batch, seq
 

@@ -82,3 +82,32 @@ def split_data(data: Sequence, val_data_ratio: float = 0.1):
     split_index = int(len(data)*(1-val_data_ratio))
     return data[:split_index], data[split_index:]
 
+
+
+color_codes = {
+    "green": "\033[32m",
+    "red": "\033[91m",
+}
+
+CLOSE_SEQ = "\033[0m"
+
+
+def format_text(text: str, color=None, bold=False):
+    if color is None:
+        text = text
+    else:
+        text = f"{color_codes[color]}{text}"
+    
+    if bold:
+        text = f"\033[1m{text}"
+    
+    return f"{text}{CLOSE_SEQ}"
+
+
+def color_sequence(sequence: list[str], correct: list[bool]):
+    """Color a sequence of strings according to whether they are correct."""
+    assert len(sequence) == len(correct)
+    return [
+        format_text(s, color="green" if c else "red", bold=True) 
+        for s, c in zip(sequence, correct)
+    ]
