@@ -4,6 +4,8 @@ import pprint
 import json
 from collections import defaultdict
 from dataclasses import asdict
+import argparse
+from tqdm import tqdm
 
 import jax
 import jax.numpy as jnp
@@ -11,13 +13,9 @@ import optax
 import chex
 import numpy as np
 import wandb
-import argparse
-from etils import epath
 import orbax.checkpoint
-from etils import epath
-from tqdm import tqdm
 from jax.typing import ArrayLike
-from flax import linen as nn
+from etils import epath
 
 from nn_utils import schedules
 from metamodels_for_rasp import on_cluster, output_dir, interactive
@@ -31,6 +29,9 @@ from rasp_tokenizer import vocab
 from rasp_tokenizer.data_utils import load_and_process_data, split_dict_data
 from rasp_tokenizer import MAX_RASP_LENGTH, MAX_WEIGHTS_LENGTH
 from rasp_tokenizer import tokenizer
+
+
+#jax.config.update("jax_disable_jit", True)
 
 
 logger = setup_logger(__name__)
@@ -58,7 +59,6 @@ def create_loss_fn(model_forward: callable):
     ) -> (float, dict):
         """Compute loss for a batch."""
         tokens = batch['rasp_tok']
-        loss_mask = get_mask(tokens)
 
         outputs = model_forward(
             {"params": params},
@@ -67,13 +67,15 @@ def create_loss_fn(model_forward: callable):
             rngs={"dropout": rng},
         )
 
+        loss_mask = get_mask(tokens)
         logits = outputs[:, -tokens.shape[1]-1:-1, :]
         loss = optax.softmax_cross_entropy_with_integer_labels(logits, tokens)
         loss = jnp.sum(loss * loss_mask) / jnp.sum(loss_mask)
         acc, correct_preds = accuracy(logits, tokens, loss_mask)
         metrics = {"accuracy": acc}
         aux = dict(outputs=outputs, logits=logits, metrics=metrics, 
-                   correct_preds=correct_preds, mask=loss_mask)
+                   correct_preds=correct_preds, mask=loss_mask,
+                   preds=logits.argmax(axis=-1))
         return loss, aux
     return loss_fn
 
@@ -84,7 +86,7 @@ def main():
 
     # model
     parser.add_argument('--d_model', type=int, default=256)
-    parser.add_argument('--dropout_rate', type=float, default=0.00)
+    parser.add_argument('--dropout_rate', type=float, default=0.0)
     parser.add_argument('--num_layers', type=int, help='Number of layers', default=None)
     parser.add_argument('--disable_tqdm', action='store_true')
     parser.add_argument('--augment', action='store_true', help="Augment base models via permutations")
@@ -156,11 +158,12 @@ def main():
             d_model=args.d_model,
             max_rasp_len=MAX_RASP_LENGTH,
             max_weights_len=MAX_WEIGHTS_LENGTH,
-        ) for name in ["test_5"]
+        ) for name in ["test_5", "test_6", "test_10"]
     }
 
 #    # normalize weights
     w_std = train_data["weights"].std()
+    logger.info(f"Weight std before normalization: {w_std}")
     train_data['weights'] = train_data['weights'] / w_std
     val_data['weights'] = val_data['weights'] / w_std
     for v in test_datasets.values():
@@ -182,7 +185,7 @@ def main():
         qkv_dim=args.d_model,
         mlp_dim=args.d_model * 4,
         max_len=seq_len,
-        dropout_rate=args.dropout_rate,
+        dropout_rate=0.0,  # no dropout on the residual stream
         attention_dropout_rate=args.dropout_rate,
 #        posemb_init=nn.initializers.zeros,
     )
@@ -328,21 +331,30 @@ def main():
 
 
     def log_rasp_snippet(
-            batch: ArrayLike, 
-            correct_preds: ArrayLike, 
+            tokens: ArrayLike, 
+            preds: ArrayLike, 
             name: str,
             snip_at: int = 10,
-            batch_element: int = 0,
         ):
-        rasp_snippet = tokenizer.decode(batch['rasp_tok'][batch_element, :snip_at])
+        """Args:
+            - tokens: 1D array of ground-truth tokens
+            - preds: 1D array of predictions
+            - name: 'train', 'val', or 'test'
+            - snip_at: number of tokens to include in snippet"""
+        correct_preds = tokens == preds
+        rasp_snippet = tokenizer.decode(tokens[:snip_at])
+        decoded_preds = tokenizer.decode(preds[:snip_at])
         rasp_snippet = color_sequence(rasp_snippet, correct_preds[:snip_at])
-        data_logger.info(f"{name}: {rasp_snippet}")
+        data_logger.info(f"{name}: {rasp_snippet} (true)")
+        data_logger.info(f"{name}: {decoded_preds} (preds)")
 
 
     def compute_metrics(state, data, name="test"):
         program_ids = []
         correct_preds = []
-        for batch in data_iterator(data, args.bs, stacked_tree=True):
+        for i, batch in enumerate(
+                    data_iterator(data, args.bs, stacked_tree=True)):
+
             chex.assert_shape(batch["rasp_tok"], (None, MAX_RASP_LENGTH)) 
             chex.assert_shape(batch["weights"],
                               (None, MAX_WEIGHTS_LENGTH/args.d_model, args.d_model))
@@ -353,12 +365,17 @@ def main():
 
             mask = np.array(aux['mask'], dtype=bool)
             program_ids += batch['program_id'].flatten().tolist()
-            correct_preds += aux['correct_preds'][mask].flatten().tolist()
+            correct_preds += aux['correct_preds'].flatten().tolist()
+            preds = aux['preds']
         
-        for idx in range(10):
-            log_rasp_snippet(data, correct_preds, name,
-                            snip_at=10,
-                            batch_element=idx)
+            if i == 0:
+                for idx in range(10):
+                    log_rasp_snippet(
+                        tokens=batch['rasp_tok'][idx],
+                        preds=preds[idx],
+                        name=name,
+                        snip_at=15,
+                    )
         data_logger.info("\n")
 
         metrics_logger.flush_mean(
@@ -402,10 +419,11 @@ def main():
 
         logger.info("Saving checkpoint...")
         checkpointer.save(
-            checkpoint_savedir / checkpoint_savename, state.params)
+            checkpoint_savedir / checkpoint_savename, (state.params, model.config))
 
-        model_config = {k: v for k, v in vars(model).items() 
-                        if not k.startswith("_")}
+        model_config = {k: v for k, v in vars(model.config).items() 
+                        if not any(k.startswith(p) for p in [
+                            "kernel", "bias", "posemb", "dtype"])}
         info = {
             'model_config': model_config,
             'ndata': args.ndata,
