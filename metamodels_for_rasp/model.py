@@ -215,11 +215,16 @@ class Transformer(nn.Module):
     config = self.config
     weights = inputs["weights"]
     prog = inputs["rasp_tok"].astype('int32')
-    chex.assert_shape(weights, (None, config.weight_len, config.emb_dim))  # batch, seq, dim
-    chex.assert_shape(prog, (None, config.rasp_tok_len))  # batch, seq
+    assert config.weight_len + config.rasp_tok_len == config.max_len
+    if not config.decode:
+      chex.assert_shape(weights, (None, config.weight_len, config.emb_dim))  # batch, seq, dim
+      chex.assert_shape(prog, (None, config.rasp_tok_len))  # batch, seq
+    else:
+      chex.assert_shape(weights, (None, None, config.emb_dim))  # batch, seq, dim
+      chex.assert_shape(prog, (None, None))  # batch, seq
 
 
-    causal_mask = jnp.tril(jnp.ones((1, 1, inputs.shape[1], inputs.shape[1])))
+    causal_mask = np.tril(np.ones((1, 1, config.max_len, config.max_len)))
     causal_mask[:, :, :config.weight_len, :config.weight_len] = 1
 
 
