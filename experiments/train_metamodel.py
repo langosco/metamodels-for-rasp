@@ -323,15 +323,17 @@ def main():
         rasp_snippet = tokenizer.decode(tokens[:snip_at])
         decoded_preds = tokenizer.decode(preds[:snip_at])
         try:
-            eos_idx = decoded_preds.index("EOS")
+            eos_idx = rasp_snippet.index("EOS")
         except ValueError:
             eos_idx = len(decoded_preds)
 
-        decoded_preds = decoded_preds[:eos_idx]
         correct_preds = correct_preds[:eos_idx]
+        rasp_snippet = rasp_snippet[:eos_idx]
 
         rasp_snippet = color_sequence(rasp_snippet, correct_preds)
         data_logger.info(f"{name}: {rasp_snippet} (true)")
+
+        decoded_preds = decoded_preds[:eos_idx]
         data_logger.info(f"{name}: {decoded_preds} (preds)")
 
 
