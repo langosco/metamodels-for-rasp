@@ -95,8 +95,13 @@ def parse_args():
     args.nsteps = min(args.nsteps, args.max_epochs * args.ndata // args.bs)
 
     logger.info("Args:\n%s", pprint.pformat(vars(args)))
+    logger.info("\n")
+    data_logger.info("Args:\n%s", pprint.pformat(vars(args)))
+    data_logger.info("\n")
 
     return args
+
+
 
 
 def load_data(args, np_rng) -> (list, list, list):
@@ -122,7 +127,7 @@ def load_data(args, np_rng) -> (list, list, list):
             d_model=args.d_model,
             max_rasp_len=MAX_RASP_LENGTH,
             max_weights_len=MAX_WEIGHTS_LENGTH,
-        ) for name in ["lib", "test_5", "test_6", "test_10", "test"]
+        ) for name in ["lib", "test_5"]
     }
 
 #    # normalize weights
@@ -317,7 +322,10 @@ def main():
         correct_preds = (tokens == preds)[:snip_at]
         rasp_snippet = tokenizer.decode(tokens[:snip_at])
         decoded_preds = tokenizer.decode(preds[:snip_at])
-        eos_idx = decoded_preds.find("<EOS>")
+        try:
+            eos_idx = decoded_preds.index("EOS")
+        except ValueError:
+            eos_idx = len(decoded_preds)
 
         decoded_preds = decoded_preds[:eos_idx]
         correct_preds = correct_preds[:eos_idx]
@@ -345,8 +353,8 @@ def main():
             for k in out.keys():
                 out[k].append(aux[k])
         
-            if i == 0:
-                for idx in range(25):
+            if i < 3:
+                for idx in range(10):
                     log_rasp_snippet(
                         tokens=batch['rasp_tok'][idx],
                         preds=aux['preds'][idx],
