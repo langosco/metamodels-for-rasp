@@ -24,8 +24,8 @@ class TransformerConfig:
   qkv_dim: int = 512
   mlp_dim: int = 2048
   max_len: int = 2048
-  dropout_rate: float = 0.3
-  attention_dropout_rate: float = 0.3
+  dropout_rate: float = 0.0
+  attention_dropout_rate: float = 0.1
   kernel_init: Callable = nn.initializers.xavier_uniform()
   bias_init: Callable = nn.initializers.normal(stddev=1e-6)
   posemb_init: Optional[Callable] = None

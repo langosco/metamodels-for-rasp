@@ -8,7 +8,6 @@ import argparse
 from tqdm import tqdm
 
 import jax
-import jax.numpy as jnp
 import optax
 import chex
 import numpy as np
@@ -22,7 +21,7 @@ from metamodels_for_rasp import on_cluster, output_dir, interactive
 from metamodels_for_rasp.train import Updater, Logger
 from metamodels_for_rasp.logger_config import setup_logger, setup_data_logger
 from metamodels_for_rasp.model import Transformer, TransformerConfig
-from metamodels_for_rasp.utils import count_params, data_iterator, color_sequence
+from metamodels_for_rasp.utils import count_params, data_iterator, color_sequence, create_loss_fn, get_fracs_correct_by_program
 
 from rasp_tokenizer import paths
 from rasp_tokenizer import vocab
@@ -40,49 +39,9 @@ START_TIME = time()
 VAL_DATA_RATIO = 0.1
 
 
-def accuracy(logits, targets, mask) -> (float, jnp.ndarray):
-    hits = (logits.argmax(axis=-1) == targets) * mask
-    return hits.sum() / mask.sum(), hits
-
-
-def get_mask(tokens):
-    """Get mask for padding tokens."""
-    return jnp.where(tokens == vocab.pad_id, 0, 1)
-
-
-def create_loss_fn(model_forward: callable):
-    def loss_fn(
-            params: dict,
-            rng: ArrayLike,
-            batch: dict,
-            is_training: bool = True,
-    ) -> (float, dict):
-        """Compute loss for a batch."""
-        tokens = batch['rasp_tok']
-
-        outputs = model_forward(
-            {"params": params},
-            batch,
-            is_training=is_training,
-            rngs={"dropout": rng},
-        )
-
-        loss_mask = get_mask(tokens)
-        logits = outputs[:, -tokens.shape[1]-1:-1, :]
-        loss = optax.softmax_cross_entropy_with_integer_labels(logits, tokens)
-        loss = jnp.sum(loss * loss_mask) / jnp.sum(loss_mask)
-        acc, correct_preds = accuracy(logits, tokens, loss_mask)
-        metrics = {"accuracy": acc}
-        aux = dict(outputs=outputs, logits=logits, metrics=metrics, 
-                   correct_preds=correct_preds, mask=loss_mask,
-                   preds=logits.argmax(axis=-1))
-        return loss, aux
-    return loss_fn
-
-
-def main():
+def parse_args():
     parser = argparse.ArgumentParser(description='Training run')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed.')
+    parser.add_argument('--seed', type=float, default=42, help='random seed')
 
     # model
     parser.add_argument('--d_model', type=int, default=256)
@@ -129,13 +88,18 @@ def main():
     args = parser.parse_args()
 
     args.tags.append("HPC" if on_cluster else "local")
+
     if args.wandb_run_name is not None:
         args.wandb_run_name += str(int(time()))
-    logger.info("Args:\n%s", pprint.pformat(vars(args)))
-    rng = jax.random.PRNGKey(args.seed)
-    np_rng = np.random.default_rng()
 
-    # Data
+    args.nsteps = min(args.nsteps, args.max_epochs * args.ndata // args.bs)
+
+    logger.info("Args:\n%s", pprint.pformat(vars(args)))
+
+    return args
+
+
+def load_data(args, np_rng) -> (list, list, list):
     data = load_and_process_data(
         rng=np_rng,
         ndata=args.ndata,
@@ -158,7 +122,7 @@ def main():
             d_model=args.d_model,
             max_rasp_len=MAX_RASP_LENGTH,
             max_weights_len=MAX_WEIGHTS_LENGTH,
-        ) for name in ["test_5", "test_6", "test_10"]
+        ) for name in ["lib", "test_5", "test_6", "test_10", "test"]
     }
 
 #    # normalize weights
@@ -166,15 +130,17 @@ def main():
     logger.info(f"Weight std before normalization: {w_std}")
     train_data['weights'] = train_data['weights'] / w_std
     val_data['weights'] = val_data['weights'] / w_std
+
     for v in test_datasets.values():
         v['weights'] = v['weights'] / w_std
 
+    return train_data, val_data, test_datasets
 
-    args.nsteps = min(args.nsteps, args.max_epochs * args.ndata // args.bs)
+
+def get_model(args):
     seq_len=MAX_RASP_LENGTH + MAX_WEIGHTS_LENGTH/args.d_model
     assert seq_len.is_integer()
     seq_len = int(seq_len)
-
 
     config = TransformerConfig(
         vocab_size=vocab.size,
@@ -189,9 +155,11 @@ def main():
         attention_dropout_rate=args.dropout_rate,
 #        posemb_init=nn.initializers.zeros,
     )
-    model = Transformer(config=config)
+    return Transformer(config=config)
 
 
+def init_updater(rng, args, model, train_data):
+    """Initialize the model and set up the optimizer."""
     @optax.inject_hyperparams
     def optimizer(lr: float, wd: float, clip_value: float) -> optax.GradientTransformation:
         opt = optax.adamw(
@@ -216,15 +184,28 @@ def main():
     opt = optimizer(lr=schedule, wd=args.wd, clip_value=20.)
     loss_fn = create_loss_fn(model.apply)
     updater = Updater(opt=opt, model=model, loss_fn=loss_fn)
-    metrics_logger = Logger()
 
-
+    # init
     dummy_batch = {
-        "weights": data['weights'][:1],
-        "rasp_tok": data['rasp_tok'][:1],
+        "weights": train_data['weights'][:1],
+        "rasp_tok": train_data['rasp_tok'][:1],
     }
     subrng, rng = jax.random.split(rng)
     state = updater.init_train_state(subrng, dummy_batch)
+    return updater, state
+
+
+def main():
+    args = parse_args()
+    rng = jax.random.PRNGKey(args.seed)
+    np_rng = np.random.default_rng()
+    train_data, val_data, test_datasets = load_data(args, np_rng)
+
+    model = get_model(args)
+    subrng, rng = jax.random.split(rng)
+    updater, state = init_updater(subrng, args, model, train_data)
+    metrics_logger = Logger()
+
 
     run = wandb.init(
         mode="online" if args.use_wandb else "disabled",
@@ -246,7 +227,7 @@ def main():
             "slurm_job_name": os.environ.get('SLURM_JOB_NAME'),
             "save_checkpoint": args.save_checkpoint,
         },
-    )  
+    )
 
     checkpoint_savedir = epath.Path(output_dir) / "mm-checkpoints" \
         / "decompile"
@@ -276,7 +257,7 @@ def main():
                     f"std: {test_data['weights'].std()}")
     logger.info(f"Percent of weights zero: "
                 f"{round(100 * (train_data['weights'] == 0).sum() / train_data['weights'].size, 2)}%")
-    logger.info(f"Expected sequence length: {seq_len}.")
+    logger.info(f"Expected sequence length: {model.config.max_len}.")
     if args.save_checkpoint:
         logger.info(f"Saving final checkpoint to {checkpoint_savedir}/{checkpoint_savename}.")
 
@@ -317,18 +298,6 @@ def main():
                     verbose=disable_tqdm, extra_metrics={"epoch": epoch})
         return state, stop_training
 
-    
-    def get_program_accuracy(program_ids: list, correct_preds: list):
-        """Get accuracy per program."""
-        preds_by_prog = defaultdict(list)
-        for prog_id, cp in zip(program_ids, correct_preds):
-            preds_by_prog[prog_id].append(cp)
-        
-        full_program_correct = [
-            all(preds) for preds in preds_by_prog.values()
-        ]
-        return np.mean(full_program_correct)
-
 
     def log_rasp_snippet(
             tokens: ArrayLike, 
@@ -340,7 +309,8 @@ def main():
             - tokens: 1D array of ground-truth tokens
             - preds: 1D array of predictions
             - name: 'train', 'val', or 'test'
-            - snip_at: number of tokens to include in snippet"""
+            - snip_at: number of tokens to include in snippet
+        """
         correct_preds = tokens == preds
         rasp_snippet = tokenizer.decode(tokens[:snip_at])
         decoded_preds = tokenizer.decode(preds[:snip_at])
@@ -350,8 +320,7 @@ def main():
 
 
     def compute_metrics(state, data, name="test"):
-        program_ids = []
-        correct_preds = []
+        out = dict(mask=[], correct_preds=[], program_id=[])
         for i, batch in enumerate(
                     data_iterator(data, args.bs, stacked_tree=True)):
 
@@ -364,19 +333,30 @@ def main():
             metrics_logger.write(state, val_metrics, name=name)
 
             mask = np.array(aux['mask'], dtype=bool)
-            program_ids += batch['program_id'].flatten().tolist()
-            correct_preds += aux['correct_preds'].flatten().tolist()
-            preds = aux['preds']
+
+            for k in out.keys():
+                out[k].append(aux[k])
         
             if i == 0:
                 for idx in range(10):
                     log_rasp_snippet(
                         tokens=batch['rasp_tok'][idx],
-                        preds=preds[idx],
+                        preds=aux['preds'][idx],
                         name=name,
                         snip_at=15,
                     )
         data_logger.info("\n")
+
+        out = {k: np.concatenate(v) for k, v in out.items()}
+
+        reconstruction_fracs = get_fracs_correct_by_program(
+            program_ids=out['program_id'],
+            correct_preds=out['correct_preds'],
+            mask=out['mask'],
+        )
+
+        program_acc = np.mean(reconstruction_fracs == 1.0)
+        program_acc_50 = np.mean(np.array(reconstruction_fracs) > 0.5)
 
         metrics_logger.flush_mean(
             state, 
@@ -384,7 +364,9 @@ def main():
             verbose=disable_tqdm, 
             extra_metrics={
                 "epoch": epoch,
-                f"{name}/program_accuracy": get_program_accuracy(program_ids, correct_preds),
+                f"{name}/program_accuracy": program_acc,
+                f"{name}/program_accuracy_50": program_acc_50,
+                f"{name}/program_accuracy_90": np.mean(np.array(reconstruction_fracs) > 0.9),
             }
         )
             

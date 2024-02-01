@@ -2,6 +2,50 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from typing import Sequence, Iterator
+from jax.typing import ArrayLike
+from rasp_tokenizer import vocab
+import optax
+import chex
+
+
+def accuracy(logits, targets, mask) -> (float, jnp.ndarray):
+    hits = (logits.argmax(axis=-1) == targets) * mask
+    return hits.sum() / mask.sum(), hits
+
+
+def get_mask(tokens):
+    """Get mask for padding tokens."""
+    return jnp.where(tokens == vocab.pad_id, 0, 1)
+
+
+def create_loss_fn(model_forward: callable):
+    def loss_fn(
+            params: dict,
+            rng: ArrayLike,
+            batch: dict,
+            is_training: bool = True,
+    ) -> (float, dict):
+        """Compute loss for a batch."""
+        tokens = batch['rasp_tok']
+
+        outputs = model_forward(
+            {"params": params},
+            batch,
+            is_training=is_training,
+            rngs={"dropout": rng},
+        )
+
+        loss_mask = get_mask(tokens)
+        logits = outputs[:, -tokens.shape[1]-1:-1, :]
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits, tokens)
+        loss = jnp.sum(loss * loss_mask) / jnp.sum(loss_mask)
+        acc, correct_preds = accuracy(logits, tokens, loss_mask)
+        metrics = {"accuracy": acc}
+        aux = dict(outputs=outputs, logits=logits, metrics=metrics, 
+                   correct_preds=correct_preds, mask=loss_mask,
+                   preds=logits.argmax(axis=-1), program_id=batch['program_id'])
+        return loss, aux
+    return loss_fn
 
 
 def data_iterator(
@@ -111,3 +155,56 @@ def color_sequence(sequence: list[str], correct: list[bool]):
         format_text(s, color="green" if c else "red", bold=True) 
         for s, c in zip(sequence, correct)
     ]
+
+
+def get_fracs_correct_by_program(
+    program_ids: chex.Array,
+    correct_preds: chex.Array,
+    mask: chex.Array,
+    ) -> list[float]:
+    """Get accuracy for each program."""
+    n = len(program_ids)
+    assert len(correct_preds) == n and len(mask) == n
+
+    fracs_correct_by_program = []
+    for i in range(n):
+        idxs = program_ids == i
+        if np.sum(idxs) == 0:
+            continue
+        cps = correct_preds[idxs]
+        m = mask[idxs]
+        cps = cps * m  # just to be safe
+        fracs_correct_by_program.append(
+            np.sum(cps) / np.sum(m))
+    return fracs_correct_by_program
+
+
+
+# Test
+if __name__ == "__main__":
+    program_ids = np.array([0,0,1,2])
+    correct_preds = np.array([
+        [0, 1, 1, 0],
+        [1, 1, 1, 1],
+        [0, 0, 1, 1],
+        [1, 1, 0, 0],
+    ])
+
+    mask = np.array([
+        [1, 1, 1, 1],
+        [1, 1, 1, 0],
+        [1, 1, 0, 0],
+        [1, 1, 0, 0],
+    ])
+
+    accs = get_fracs_correct_by_program(
+        program_ids=program_ids,
+        correct_preds=correct_preds,
+        mask=mask,
+    )
+
+    expected = [5/7, 0.0, 1.0]
+
+    assert np.all(accs == expected), (
+        f"Expected {expected}, got {accs}."
+    )
