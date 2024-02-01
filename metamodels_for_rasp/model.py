@@ -31,6 +31,7 @@ class TransformerConfig:
   kernel_init: Callable = nn.initializers.xavier_uniform()
   bias_init: Callable = nn.initializers.normal(stddev=1e-6)
   posemb_init: Optional[Callable] = None
+  decode: bool = False
 
 
 def sinusoidal_init(max_len=2048):
@@ -173,6 +174,7 @@ class Encoder1DBlock(nn.Module):
         broadcast_dropout=False,
         dropout_rate=config.attention_dropout_rate,
         deterministic=deterministic,
+        decode=config.decode,
     )(x, mask=causal_mask)
 
     x = nn.Dropout(rate=config.dropout_rate)(x, deterministic=deterministic)
