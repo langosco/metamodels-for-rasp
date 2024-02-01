@@ -138,11 +138,14 @@ def load_data(args, np_rng) -> (list, list, list):
 
 
 def get_model(args):
-    seq_len=MAX_RASP_LENGTH + MAX_WEIGHTS_LENGTH/args.d_model
-    assert seq_len.is_integer()
-    seq_len = int(seq_len)
+    weight_len = MAX_WEIGHTS_LENGTH/args.d_model
+    assert weight_len.is_integer()
+    weight_len = int(weight_len)
+    seq_len = MAX_RASP_LENGTH + weight_len
 
     config = TransformerConfig(
+        weight_len=weight_len,
+        rasp_tok_len=MAX_RASP_LENGTH,
         vocab_size=vocab.size,
         output_vocab_size=vocab.size,
         emb_dim=args.d_model,

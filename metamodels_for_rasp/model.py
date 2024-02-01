@@ -24,6 +24,8 @@ class TransformerConfig:
   qkv_dim: int = 512
   mlp_dim: int = 2048
   max_len: int = 2048
+  weight_len: int = 128
+  rasp_tok_len: int = 32
   dropout_rate: float = 0.0
   attention_dropout_rate: float = 0.1
   kernel_init: Callable = nn.initializers.xavier_uniform()
@@ -146,7 +148,7 @@ class Encoder1DBlock(nn.Module):
   config: TransformerConfig
 
   @nn.compact
-  def __call__(self, inputs, deterministic):
+  def __call__(self, inputs, deterministic, causal_mask):
     """Applies Encoder1DBlock module.
 
     Args:
@@ -157,8 +159,6 @@ class Encoder1DBlock(nn.Module):
       output after transformer encoder block.
     """
     config = self.config
-    causal_mask = jnp.tril(jnp.ones((1, 1, inputs.shape[1], inputs.shape[1])))
-
 
     # Attention block.
     assert inputs.ndim == 3
@@ -213,8 +213,13 @@ class Transformer(nn.Module):
     config = self.config
     weights = inputs["weights"]
     prog = inputs["rasp_tok"].astype('int32')
-    chex.assert_shape(weights, (None, None, config.emb_dim))  # batch, seq, dim
-    chex.assert_shape(prog, (None, None))  # batch, seq
+    chex.assert_shape(weights, (None, config.weight_len, config.emb_dim))  # batch, seq, dim
+    chex.assert_shape(prog, (None, config.rasp_tok_len))  # batch, seq
+
+
+    causal_mask = jnp.tril(jnp.ones((1, 1, inputs.shape[1], inputs.shape[1])))
+    causal_mask[:, :, :config.weight_len, :config.weight_len] = 1
+
 
     prog = nn.Embed(
         num_embeddings=config.vocab_size, features=config.emb_dim, name='embed'
@@ -226,7 +231,8 @@ class Transformer(nn.Module):
     x = AddPositionEmbs(config)(x)
 
     for _ in range(config.num_layers):
-      x = Encoder1DBlock(config)(x, deterministic=not train)
+      x = Encoder1DBlock(config)(x, deterministic=not train, 
+                                 causal_mask=causal_mask)
 
     x = nn.LayerNorm(dtype=config.dtype)(x)
     logits = nn.Dense(
