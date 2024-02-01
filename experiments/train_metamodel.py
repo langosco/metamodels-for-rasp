@@ -314,10 +314,15 @@ def main():
             - name: 'train', 'val', or 'test'
             - snip_at: number of tokens to include in snippet
         """
-        correct_preds = tokens == preds
+        correct_preds = (tokens == preds)[:snip_at]
         rasp_snippet = tokenizer.decode(tokens[:snip_at])
         decoded_preds = tokenizer.decode(preds[:snip_at])
-        rasp_snippet = color_sequence(rasp_snippet, correct_preds[:snip_at])
+        eos_idx = decoded_preds.find("<EOS>")
+
+        decoded_preds = decoded_preds[:eos_idx]
+        correct_preds = correct_preds[:eos_idx]
+
+        rasp_snippet = color_sequence(rasp_snippet, correct_preds)
         data_logger.info(f"{name}: {rasp_snippet} (true)")
         data_logger.info(f"{name}: {decoded_preds} (preds)")
 
@@ -341,7 +346,7 @@ def main():
                 out[k].append(aux[k])
         
             if i == 0:
-                for idx in range(10):
+                for idx in range(25):
                     log_rasp_snippet(
                         tokens=batch['rasp_tok'][idx],
                         preds=aux['preds'][idx],
