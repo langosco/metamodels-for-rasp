@@ -157,12 +157,14 @@ def color_sequence(sequence: list[str], correct: list[bool]):
     ]
 
 
-def get_fracs_correct_by_program(
+def compute_fracs_correct_by_program(
     program_ids: chex.Array,
     correct_preds: chex.Array,
     mask: chex.Array,
     ) -> list[float]:
-    """Get accuracy for each program."""
+    """For each program, compute the fraction of tokens in the program that
+    were predicted correctly.
+    Return a list of floats, one for each program."""
     n = len(program_ids)
     assert len(correct_preds) == n and len(mask) == n
 
@@ -197,7 +199,7 @@ if __name__ == "__main__":
         [1, 1, 0, 0],
     ])
 
-    accs = get_fracs_correct_by_program(
+    accs = compute_fracs_correct_by_program(
         program_ids=program_ids,
         correct_preds=correct_preds,
         mask=mask,

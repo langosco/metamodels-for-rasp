@@ -21,7 +21,7 @@ from metamodels_for_rasp import on_cluster, output_dir, interactive
 from metamodels_for_rasp.train import Updater, Logger
 from metamodels_for_rasp.logger_config import setup_logger, setup_data_logger
 from metamodels_for_rasp.model import Transformer, TransformerConfig
-from metamodels_for_rasp.utils import count_params, data_iterator, color_sequence, create_loss_fn, get_fracs_correct_by_program
+from metamodels_for_rasp.utils import count_params, data_iterator, color_sequence, create_loss_fn, compute_fracs_correct_by_program
 
 from rasp_tokenizer import paths
 from rasp_tokenizer import vocab
@@ -103,7 +103,6 @@ def parse_args():
 
 
 
-
 def load_data(args, np_rng) -> (list, list, list):
     data = load_and_process_data(
         rng=np_rng,
@@ -127,7 +126,7 @@ def load_data(args, np_rng) -> (list, list, list):
             d_model=args.d_model,
             max_rasp_len=MAX_RASP_LENGTH,
             max_weights_len=MAX_WEIGHTS_LENGTH,
-        ) for name in ["lib", "test_5"]
+        ) for name in ["lib", "test"]
     }
 
 #    # normalize weights
@@ -207,11 +206,17 @@ def main():
     args = parse_args()
     rng = jax.random.PRNGKey(args.seed)
     np_rng = np.random.default_rng()
-    train_data, val_data, test_datasets = load_data(args, np_rng)
+
+    with jax.default_device(jax.devices("cpu")[0]):
+        train_data, val_data, test_datasets = load_data(args, np_rng)
 
     model = get_model(args)
     subrng, rng = jax.random.split(rng)
-    updater, state = init_updater(subrng, args, model, train_data)
+    batch_for_init = {
+        "weights": train_data['weights'][:1],
+        "rasp_tok": train_data['rasp_tok'][:1],
+    }
+    updater, state = init_updater(subrng, args, model, batch_for_init)
     metrics_logger = Logger()
 
 
@@ -323,7 +328,7 @@ def main():
         rasp_snippet = tokenizer.decode(tokens[:snip_at])
         decoded_preds = tokenizer.decode(preds[:snip_at])
         try:
-            eos_idx = rasp_snippet.index("EOS")
+            eos_idx = rasp_snippet.index("EOS") + 1
         except ValueError:
             eos_idx = len(decoded_preds)
 
@@ -367,7 +372,7 @@ def main():
 
         out = {k: np.concatenate(v) for k, v in out.items()}
 
-        reconstruction_fracs = get_fracs_correct_by_program(
+        reconstruction_fracs = compute_fracs_correct_by_program(
             program_ids=out['program_id'],
             correct_preds=out['correct_preds'],
             mask=out['mask'],

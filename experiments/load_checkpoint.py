@@ -18,12 +18,12 @@ from metamodels_for_rasp import on_cluster
 from metamodels_for_rasp.train import Logger
 from metamodels_for_rasp.logger_config import setup_logger, setup_data_logger
 from metamodels_for_rasp.model import Transformer, TransformerConfig
-from metamodels_for_rasp.utils import count_params, data_iterator, color_sequence, create_loss_fn, get_fracs_correct_by_program
+from metamodels_for_rasp.utils import count_params, data_iterator, color_sequence, create_loss_fn, compute_fracs_correct_by_program
 
 from rasp_tokenizer import paths
 from rasp_tokenizer.data_utils import load_and_process_data
 from rasp_tokenizer import MAX_RASP_LENGTH, MAX_WEIGHTS_LENGTH
-from rasp_tokenizer import tokenizer
+from rasp_tokenizer import tokenizer, vocab
 
 
 logger = setup_logger(__name__)
@@ -33,15 +33,13 @@ checkpointer = orbax.checkpoint.PyTreeCheckpointer()
 
 TEST_DATA_NAMES = [
 #    "train",
-    "test_5",
-    "test_6",
-    "test_10",
+#    "test_5",
     "test",
     "lib",
 ]
 
 
-def get_data(d_model: int):
+def load_data(d_model: int, test_data_names=TEST_DATA_NAMES):
     TRAIN_DATA_STD = 2.656
 
     test_datasets = {
@@ -53,22 +51,20 @@ def get_data(d_model: int):
             d_model=d_model,
             max_rasp_len=MAX_RASP_LENGTH,
             max_weights_len=MAX_WEIGHTS_LENGTH,
-        ) for name in TEST_DATA_NAMES
+        ) for name in test_data_names
     }
 
     for v in test_datasets.values():
         v['weights'] = v['weights'] / TRAIN_DATA_STD
 
-    seq_len=MAX_RASP_LENGTH + MAX_WEIGHTS_LENGTH/d_model
-    assert seq_len.is_integer()
-    seq_len = int(seq_len)
-
-    return test_datasets, seq_len
+    return test_datasets
 
 
 def get_model(checkpoint_path: str):
     params, config = checkpointer.restore(checkpoint_path)
     config = {k: v for k, v in config.items() if v is not None}
+    config['decode'] = False  # no caching for now
+#    config['weight_len'] = int(MAX_WEIGHTS_LENGTH / config['emb_dim'])
     config = TransformerConfig(**config)
     model = Transformer(config)
     return model, params
@@ -100,94 +96,81 @@ def log_rasp_snippet(
     return None
 
 
-def get_program_list(metrics: dict[str, ArrayLike]) -> list[list[dict]]:
-    """Convert dict of metrics into list of lists of dicts, one list 
-    per program. That is, 
-    - the output is a list of programs, where 
-    - each program is a list of dicts, where 
-    - each dict corresponds to one layer.
+def pass_over_test_set(data, loss_fn, params, bs=256, decode=False):
+    """One forward pass over a test set."""
+    out = dict(mask=[], correct_preds=[])
+    dummy_rng = jax.random.PRNGKey(0)  # dropout is off
+    for batch in data_iterator(data, bs, stacked_tree=True):
+        if decode is None:
+            loss, aux = loss_fn(params, dummy_rng, batch, is_training=False)
+        else:
+            aux = decode(params, batch)
+
+        for k in out.keys():
+            out[k].append(aux[k])
+
+    out = {k: np.concatenate(v) for k, v in out.items()}
+    chex.assert_equal_shape_prefix(list(out.values()) + [data['rasp_tok']], prefix_len=2)
+    return out
+
+
+categories = {
+    "encodings": tokenizer.encode(vocab.encodings),
+    "ops": tokenizer.encode(vocab.ops),
+    "maps": tokenizer.encode(vocab.maps),
+    "variables": tokenizer.encode(vocab.sop_variables + vocab.inputs),
+    "comparisons": tokenizer.encode(vocab.comparisons),
+    "Map": vocab.vocab.index("Map"),
+    "SequenceMap (both)": tokenizer.encode(["SequenceMap", "LinearSequenceMap"]),
+    "LinearSequenceMap": vocab.vocab.index("LinearSequenceMap"),
+    "SequenceMap": vocab.vocab.index("SequenceMap"),
+    "SelectAggregate": vocab.vocab.index("SelectAggregate"),
+    "SelectorWidth": vocab.vocab.index("SelectorWidth"),
+}
+
+
+def compute_token_acc_for_category(
+        token_category: chex.Array,
+        correct_preds: chex.Array,
+        true_tokens: chex.Array,
+    ) -> float:
     """
-    programs = defaultdict(list)
-
-    l = len(metrics['program_id'])
-    assert all(len(v) == l for v in metrics.values())
-
-    for program_id, *values in zip(metrics['program_id'], *metrics.values()):
-        programs[program_id].append({
-            k: v for k, v in zip(metrics.keys(), values)
-        })
-
-    return list(programs.values())
-
-
-def get_programs_by_length(programs: list[list[dict]]) -> dict[int, float]:
-    """Reshuffle to get dict mapping: program_length -> list[programs]"""
-    programs_by_length = defaultdict(list)
-    for program in programs:
-        length = program[0]['n_sops']
-        assert all([x['n_sops'] == length for x in program])
-        programs_by_length[length].append(program)
-    return programs_by_length
+    Args:
+        token_category: 0-d array, 1-d array, or list of tokens
+        correct_preds: (n, seq_len) array of correct predictions
+        true_tokens: (n, seq_len) array of true tokens
     
-
-def compute_overall_accuracy(layers: list[dict], assert_same_program=False) -> float:
-    """Get overall accuracy for a list of layers. That is, the
-    fraction of tokens that were correctly predicted. 
-    Assume layers is a list of dicts, where each dict 
-    corresponds to predictions for one layer.
+    Returns:
+        float: mean accuracy for the given token category
     """
-    if assert_same_program:
-        assert all([x['program_id'] == layers[0]['program_id'] for x in layers])
-    masks = [x['mask'] for x in layers]
-    correct_preds = [x['correct_preds'] for x in layers]
-    return np.sum(correct_preds) / np.sum(masks)
+    where_tokens = np.where(np.isin(true_tokens, token_category))
+    relevant_preds = correct_preds[where_tokens]
+    return np.mean(relevant_preds)
 
 
-def compute_all(data, save=False):
-    metrics = compute_metrics(data=data)
-    metrics.update({
-        "program_id": data['program_id'],
-        "n_sops": data['n_sops'],
-        "rasp_tok": data['rasp_tok'],
-    })
-
-    if save:
-        savepath = paths.data_dir / "metrics-lib.pkl"
-        with open(savepath, 'wb') as f:
-            pickle.dump(metrics, f)
-
-
-    programs = get_program_list(metrics)
-    reconstruction_frac = np.mean([compute_overall_accuracy(x) == 1 for x in programs])
-
-    # fraction of all tokens recovered, by length
-    accs_by_length = {
-        length: compute_overall_accuracy([l for p in programs for l in p])
-        for length, programs in get_programs_by_length(programs).items()
+def compute_token_acc_for_all_categories(
+        categories: dict,
+        correct_preds: chex.Array,
+        true_tokens: chex.Array,
+    ) -> dict:
+    """
+    Args:
+        categories: dict of token categories
+        correct_preds: (n, seq_len) array of correct predictions
+        true_tokens: (n, seq_len) array of true tokens
+    
+    Returns:
+        dict: mean accuracy for each token category
+    """
+    return {
+        k: compute_token_acc_for_category(v, correct_preds, true_tokens)
+        for k, v in categories.items()
     }
 
 
-    # fraction of programs recovered 100%, by length
-    rf_by_length = {
-        length: np.mean([compute_overall_accuracy(p, True) == 1 for p in programs])
-        for length, programs in get_programs_by_length(programs).items()
-    }
-
-    print()
-    print("Overall program acc:", reconstruction_frac)
-    pprint.pprint("Overall token acc by length:", accs_by_length)
-    pprint.pprint("Program acc by length:", rf_by_length)
-
-    return reconstruction_frac, accs_by_length, rf_by_length
-
-
-for data_name, data in test_datasets.items():
-    print()
-    print()
-    print(data_name)
-    compute_all(data, save=(data_name == 'lib'))
-
-
+def save_to_json(data: dict, path: str):
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=4)
 
 
 def main():
@@ -200,6 +183,8 @@ def main():
     parser.add_argument('--wandb_run_name', type=str, default=None)
     parser.add_argument('--seed', type=int, default=0, help='Random seed.')
     parser.add_argument('--checkpoint_path', type=str, default=None)
+    parser.add_argument('--autoregressive', action='store_true', 
+                        help="Use autoregressive decoding.")
 
     args = parser.parse_args()
 
@@ -210,62 +195,111 @@ def main():
     if args.wandb_run_name is not None:
         args.wandb_run_name += str(int(time()))
     logger.info("Args:\n%s", pprint.pformat(vars(args)))
-    rng = jax.random.PRNGKey(args.seed)
-    np_rng = np.random.default_rng()
-    metrics_logger = Logger()
 
     model, params = get_model(args.checkpoint_path)
-    test_datasets, seq_len = get_data(model.config.emb_dim)
+    test_datasets = load_data(model.config.emb_dim)
     log_stuff(test_datasets, params, model)
     loss_fn = create_loss_fn(model.apply)
 
     
     print()
-    print()
     for x in test_datasets.values():
         print("dataset keys:", x.keys())
     print()
-    print()
 
 
-    def compute_metrics(data, bs=128):
-        """One forward pass over a test set."""
-        out = dict(logits=[], mask=[], correct_preds=[])
+    weight_len = model.config.weight_len
+    rasp_tok_len = model.config.rasp_tok_len
+
+
+    def forward(params: dict, batch: dict):
         dummy_rng = jax.random.PRNGKey(0)  # dropout is off
-        for batch in data_iterator(data, bs, stacked_tree=True):
-            chex.assert_shape(batch["rasp_tok"], (None, MAX_RASP_LENGTH)) 
-            chex.assert_shape(batch["weights"],
-                              (None, MAX_WEIGHTS_LENGTH/model.config.emb_dim, model.config.emb_dim))
-            
-            loss, aux = loss_fn(params, dummy_rng, batch, is_training=False)
+        out = model.apply(
+            {'params': params},
+            {k: v for k, v in batch.items()},
+            is_training=False,
+            rngs={'dropout': dummy_rng},
+        )
 
-            for k in out.keys():
-                out[k].append(aux[k])
+        logits = out[:, weight_len-1:-1, :]
+        return logits
 
-        out = {k: np.concatenate(v) for k, v in out.items()}
-        chex.assert_equal_shape_prefix(list(out.values()) + [data['rasp_tok']], prefix_len=2)
-        return out
+
+    def get_next_pred(params: dict, batch: dict, i: int):
+        """Get temperature=0 prediction for next token at
+        position i in the sequence (not counting weights)."""
+        logits = forward(params, batch)
+        next_logits = logits[:, i, :]
+        preds = next_logits.argmax(axis=-1).astype(np.int32)
+        return preds
+
+
+    def get_mask(tokens):
+        """Get mask for padding tokens."""
+        return np.where(tokens == vocab.pad_id, 0, 1)
+
+
+    def decode(params, batch: dict):
+        """Autoregressively decode the batch."""
+        output = {
+            "weights": batch["weights"],
+            "rasp_tok": np.zeros(batch['rasp_tok'].shape).astype(int),
+        }
+        correct_preds = np.zeros(batch['rasp_tok'].shape).astype(int)
+        for i in range(0, rasp_tok_len):
+            if i == 0:
+                output['rasp_tok'][:, i] = vocab.bos_id
+            output['rasp_tok'][:, i] = get_next_pred(params, output, i)
+            correct_preds[:, i] = output['rasp_tok'][:, i] == batch['rasp_tok'][:, i]
+        
+        #output = output['rasp_tok']
+        output = {
+            "correct_preds": correct_preds,
+            "mask": get_mask(batch['rasp_tok']),
+        }
+        return output
 
 
     for name, data in test_datasets.items():
-        m = compute_metrics(data)
-        fracs_corr = get_fracs_correct_by_program(
-            program_ids=m['program_id'],
+        logger.info(f"Evaluating dataset {name}...")
+        if args.autoregressive:
+            decode = decode
+        else:
+            decode = None
+        m = pass_over_test_set(data, loss_fn=loss_fn, params=params, bs=256,
+                               decode=decode)
+        fracs_corr = compute_fracs_correct_by_program(
+            program_ids=data['program_id'],
             correct_preds=m['correct_preds'],
             mask=m['mask'],
         )
 
-        print()
-        print(name)
-        print("Program accuracy:", np.mean(fracs_corr))
-
         if name == 'lib':
-            savepath = paths.data_dir / "metrics-lib.pkl"
+            savepath = paths.data_dir / "metrics" / "metrics-lib.pkl"
+            os.makedirs(savepath.parent, exist_ok=True)
+            logger.info(f"Saving metrics for lib dataset to {savepath}.")
             with open(savepath, 'wb') as f:
                 pickle.dump(m, f)
 
+        logger.info(f"Overall accuracy: {np.mean(fracs_corr)}")
 
-        plt.hist(fracs_corr, bins=20)
+        accs_by_category = compute_token_acc_for_all_categories(
+            categories=categories,
+            correct_preds=m['correct_preds'],
+            true_tokens=data['rasp_tok'],
+        )
+
+        logger.info("Token accuracy by category:")
+        for k, v in accs_by_category.items():
+            logger.info(f"{k}: {v}")
+
+        if not args.autoregressive:
+            savepath = paths.data_dir / 'metrics' / f"{name}-metrics-by-category.json"
+        else:
+            savepath = paths.data_dir / 'metrics' / f"{name}-metrics-by-category-autoregressive.json"
+        os.makedirs(savepath.parent, exist_ok=True)
+        logger.info(f"Saving metrics to {savepath}.")
+        save_to_json(accs_by_category, savepath)
 
 
 
