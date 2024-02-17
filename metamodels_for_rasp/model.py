@@ -202,7 +202,7 @@ class Transformer(nn.Module):
 
     Args:
       input: dict with keys 'program' and 'weights'.
-        'rasp_tok' is a tokenized RASP program.
+        'tokens' is a tokenized RASP program.
         'weights' is an array of weights from the compiled model.
       inputs: input data
       train: if it is training.
@@ -214,7 +214,7 @@ class Transformer(nn.Module):
     train = is_training
     config = self.config
     weights = inputs["weights"]
-    prog = inputs["rasp_tok"].astype('int32')
+    prog = inputs["tokens"].astype('int32')
     assert config.weight_len + config.rasp_tok_len == config.max_len
     if not config.decode:
       chex.assert_shape(weights, (None, config.weight_len, config.emb_dim))  # batch, seq, dim

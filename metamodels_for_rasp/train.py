@@ -57,7 +57,7 @@ class Updater:
         )
     
     @functools.partial(jit, static_argnums=0)
-    def update(self, state: TrainState, data) -> (TrainState, dict):
+    def update(self, state: TrainState, data) -> tuple[TrainState, dict]:
         state.rng, subkey = jax.random.split(state.rng)
         (loss, aux), grads = value_and_grad(self.loss_fn, has_aux=True)(
                 state.params, subkey, data)
@@ -81,7 +81,7 @@ class Updater:
     def compute_val_metrics(self, 
                             state: TrainState, 
                             data: dict,
-                            name="val") -> (TrainState, dict):
+                            name="val") -> tuple[TrainState, dict]:
         state.rng, subkey = random.split(state.rng)
         metrics, aux = self.get_metrics_and_loss(subkey, state.params, data)
         metrics = {f"{name}/{k}": v for k, v in metrics.items()}

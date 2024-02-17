@@ -23,11 +23,10 @@ from metamodels_for_rasp.logger_config import setup_logger, setup_data_logger
 from metamodels_for_rasp.model import Transformer, TransformerConfig
 from metamodels_for_rasp.utils import count_params, data_iterator, color_sequence, create_loss_fn, compute_fracs_correct_by_program
 
-from rasp_tokenizer import paths
-from rasp_tokenizer import vocab
-from rasp_tokenizer.data_utils import load_and_process_data, split_dict_data
-from rasp_tokenizer import MAX_RASP_LENGTH, MAX_WEIGHTS_LENGTH
-from rasp_tokenizer import tokenizer
+from decompile_tracr.dataset import config as dataset_config
+from decompile_tracr.dataset import data_utils
+from decompile_tracr.tokenizing import vocab
+from decompile_tracr.tokenizing import tokenizer
 
 
 #jax.config.update("jax_disable_jit", True)
@@ -37,6 +36,9 @@ logger = setup_logger(__name__)
 data_logger = setup_data_logger()
 START_TIME = time()
 VAL_DATA_RATIO = 0.1
+MAX_RASP_LENGTH = dataset_config.MAX_RASP_LENGTH
+MAX_WEIGHTS_LENGTH = dataset_config.MAX_WEIGHTS_LENGTH
+FULL_DATA_DIR = epath.Path(dataset_config.full_dataset_dir)
 
 
 def parse_args():
@@ -57,9 +59,9 @@ def parse_args():
     parser.add_argument('--init_scale', type=float, default=1.0)
 
     # training
-    parser.add_argument('--nsteps', type=int, default=np.inf)
+    parser.add_argument('--max_steps', type=int, default=np.inf)
     parser.add_argument('--max_runtime', type=int, help='Max runtime in minutes', default=np.inf)
-    parser.add_argument('--max_epochs', type=int, default=10**8)
+    parser.add_argument('--max_epochs', type=int, default=10**5)
     parser.add_argument('--save_checkpoint', action='store_true', 
             help='Save checkpoint at the end of training')
     parser.add_argument('--val_every', type=int, default=5)
@@ -77,7 +79,6 @@ def parse_args():
     # data
     parser.add_argument('--ndata', type=int, 
                         help='Number of training datapoints', default=20_000)
-    parser.add_argument('--data_dir', type=str, default=paths.data_dir)
 
     # wandb
     parser.add_argument('--use_wandb', action='store_true')
@@ -92,8 +93,6 @@ def parse_args():
     if args.wandb_run_name is not None:
         args.wandb_run_name += str(int(time()))
 
-    args.nsteps = min(args.nsteps, args.max_epochs * args.ndata // args.bs)
-
     logger.info("Args:\n%s", pprint.pformat(vars(args)))
     logger.info("\n")
     data_logger.info("Args:\n%s", pprint.pformat(vars(args)))
@@ -103,10 +102,11 @@ def parse_args():
 
 
 
-def load_data(args, np_rng) -> (list, list, list):
-    data = load_and_process_data(
-        rng=np_rng,
-        ndata=args.ndata,
+def load_data(args, rng: np.random.Generator) -> tuple[list, list, list]:
+    data = data_utils.load_and_process_data(
+        rng=rng,
+        loaddir=FULL_DATA_DIR,
+        max_data=args.ndata,
         shuffle=True,
         name="train",
         d_model=args.d_model,
@@ -114,13 +114,13 @@ def load_data(args, np_rng) -> (list, list, list):
         max_weights_len=MAX_WEIGHTS_LENGTH,
     )
 
-    train_data, val_data = split_dict_data(
+    train_data, val_data = data_utils.split_dict_data(
         data, val_ratio=VAL_DATA_RATIO)
 
     test_datasets = {
-        name: load_and_process_data(
+        name: data_utils.load_and_process_data(
             rng=None,
-            ndata=None,
+            max_data=None,
             shuffle=False,
             name=name,
             d_model=args.d_model,
@@ -141,7 +141,7 @@ def load_data(args, np_rng) -> (list, list, list):
     return train_data, val_data, test_datasets
 
 
-def get_model(args):
+def _get_model(args):
     weight_len = MAX_WEIGHTS_LENGTH/args.d_model
     assert weight_len.is_integer()
     weight_len = int(weight_len)
@@ -165,8 +165,9 @@ def get_model(args):
     return Transformer(config=config)
 
 
-def init_updater(rng, args, model, train_data):
+def init(rng, args, train_data) -> tuple[Transformer, Updater, dict]:
     """Initialize the model and set up the optimizer."""
+    model = _get_model(args)
     @optax.inject_hyperparams
     def optimizer(lr: float, wd: float, clip_value: float) -> optax.GradientTransformation:
         opt = optax.adamw(
@@ -180,12 +181,14 @@ def init_updater(rng, args, model, train_data):
             optax.clip_by_global_norm(clip_value),
             opt,
         )
+    
+    num_steps = len(train_data['tokens']) // args.bs
 
     schedule = schedules.constant_with_warmup_and_cooldown(
         args.lr,
-        args.nsteps, 
-        warmup_length=args.nsteps//5, 
-        cooldown_start=int(args.nsteps*0.75), 
+        total_steps=num_steps, 
+        warmup_length=num_steps//5, 
+        cooldown_start=int(num_steps*0.75), 
         max_lr=args.lr*4,
     )
     opt = optimizer(lr=schedule, wd=args.wd, clip_value=20.)
@@ -195,11 +198,11 @@ def init_updater(rng, args, model, train_data):
     # init
     dummy_batch = {
         "weights": train_data['weights'][:1],
-        "rasp_tok": train_data['rasp_tok'][:1],
+        "tokens": train_data['tokens'][:1],
     }
     subrng, rng = jax.random.split(rng)
     state = updater.init_train_state(subrng, dummy_batch)
-    return updater, state
+    return model, updater, state
 
 
 def main():
@@ -207,16 +210,10 @@ def main():
     rng = jax.random.PRNGKey(args.seed)
     np_rng = np.random.default_rng()
 
-    with jax.default_device(jax.devices("cpu")[0]):
-        train_data, val_data, test_datasets = load_data(args, np_rng)
+    train_data, val_data, test_datasets = load_data(args, np_rng)
 
-    model = get_model(args)
     subrng, rng = jax.random.split(rng)
-    batch_for_init = {
-        "weights": train_data['weights'][:1],
-        "rasp_tok": train_data['rasp_tok'][:1],
-    }
-    updater, state = init_updater(subrng, args, model, batch_for_init)
+    model, updater, state = init(subrng, args, train_data)
     metrics_logger = Logger()
 
 
@@ -252,17 +249,16 @@ def main():
 
     logger.info(f"Tags: {args.tags}")
     logger.info("Number of training examples: "
-                f"{len(train_data['rasp_tok'])}.")
+                f"{len(train_data['tokens'])}.")
     logger.info("Number of validation examples: "
-                f"{len(val_data['rasp_tok'])}.")
-    for test_data in test_datasets.values():
-        logger.info("Number of test examples: "
-                    f"{len(test_data['rasp_tok'])}.")
-    logger.info(f"Total number of steps: {args.nsteps}")
+                f"{len(val_data['tokens'])}.")
+    for name, test_data in test_datasets.items():
+        logger.info(f"Number of test examples in {name}: "
+                    f"{len(test_data['tokens'])}.")
     logger.info(f"Number of parameters in meta-model: "
                 f"{count_params(state.params) / 1e6} Million")
     logger.info(f"Data shapes: weights: {train_data['weights'].shape}, "
-                f"rasp_tok: {train_data['rasp_tok'].shape}")
+                f"tokens: {train_data['tokens'].shape}")
     logger.info(f"Train data (weights) mean: {train_data['weights'].mean()}, "
                 f"std: {train_data['weights'].std()}")
     for test_data in test_datasets.values():
@@ -276,6 +272,7 @@ def main():
 
 
     def train(state):
+        """Train for one epoch. Return updated state."""
         # TODO: shuffle train data
         stop_training = False
         for batch in tqdm(
@@ -285,7 +282,7 @@ def main():
             ):
             chex.assert_shape(batch["weights"], 
                               (args.bs, MAX_WEIGHTS_LENGTH/args.d_model, args.d_model))
-            chex.assert_shape(batch["rasp_tok"], (args.bs, MAX_RASP_LENGTH)) 
+            chex.assert_shape(batch["tokens"], (args.bs, MAX_RASP_LENGTH)) 
             state, train_metrics = updater.update(state, batch)
             metrics_logger.write(state, train_metrics, name="train")
 
@@ -294,7 +291,7 @@ def main():
                 stop_training = True
                 break
 
-            if state.step > args.nsteps:
+            if state.step > args.max_steps:
                 logger.info("Maximum number of steps reached. Stopping "
                             "training.")
                 stop_training = True
@@ -347,7 +344,7 @@ def main():
         for i, batch in enumerate(
                     data_iterator(data, args.bs, stacked_tree=True)):
 
-            chex.assert_shape(batch["rasp_tok"], (None, MAX_RASP_LENGTH)) 
+            chex.assert_shape(batch["tokens"], (None, MAX_RASP_LENGTH)) 
             chex.assert_shape(batch["weights"],
                               (None, MAX_WEIGHTS_LENGTH/args.d_model, args.d_model))
 
@@ -361,13 +358,17 @@ def main():
                 out[k].append(aux[k])
         
             if i < 3:
-                for idx in range(10):
-                    log_rasp_snippet(
-                        tokens=batch['rasp_tok'][idx],
-                        preds=aux['preds'][idx],
-                        name=name,
-                        snip_at=15,
-                    )
+                for idx in range(15):
+                    try:
+                        log_rasp_snippet(
+                            tokens=batch['tokens'][idx],
+                            preds=aux['preds'][idx],
+                            name=name,
+                            snip_at=15,
+                        )
+                    except IndexError:
+                        break
+
         data_logger.info("\n")
 
         out = {k: np.concatenate(v) for k, v in out.items()}
@@ -432,7 +433,6 @@ def main():
         info = {
             'model_config': model_config,
             'ndata': args.ndata,
-            'nsteps': args.nsteps,
         }
         with open(checkpoint_savedir / "info.json", "w") as f:
             json.dump(info, f, indent=4)

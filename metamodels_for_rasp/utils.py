@@ -3,12 +3,13 @@ import jax.numpy as jnp
 import numpy as np
 from typing import Sequence, Iterator
 from jax.typing import ArrayLike
-from rasp_tokenizer import vocab
 import optax
 import chex
 
+from decompile_tracr.tokenizing import vocab
 
-def accuracy(logits, targets, mask) -> (float, jnp.ndarray):
+
+def accuracy(logits, targets, mask) -> tuple[float, jnp.ndarray]:
     hits = (logits.argmax(axis=-1) == targets) * mask
     return hits.sum() / mask.sum(), hits
 
@@ -24,9 +25,9 @@ def create_loss_fn(model_forward: callable):
             rng: ArrayLike,
             batch: dict,
             is_training: bool = True,
-    ) -> (float, dict):
+    ) -> tuple[float, dict]:
         """Compute loss for a batch."""
-        tokens = batch['rasp_tok']
+        tokens = batch['tokens']
 
         outputs = model_forward(
             {"params": params},
