@@ -2,7 +2,6 @@ from time import time
 import os
 import pprint
 import json
-from collections import defaultdict
 from dataclasses import asdict
 import argparse
 from tqdm import tqdm
@@ -30,7 +29,7 @@ from decompile_tracr.tokenizing import tokenizer
 
 
 #jax.config.update("jax_disable_jit", True)
-
+#jax.config.update("jax_debug_nans", True)
 
 logger = setup_logger(__name__)
 data_logger = setup_data_logger()
@@ -38,7 +37,7 @@ START_TIME = time()
 VAL_DATA_RATIO = 0.1
 MAX_RASP_LENGTH = dataset_config.MAX_RASP_LENGTH
 MAX_WEIGHTS_LENGTH = dataset_config.MAX_WEIGHTS_LENGTH
-FULL_DATA_DIR = epath.Path(dataset_config.full_dataset_dir)
+FULL_DATA_DIR = dataset_config.full_dataset_dir
 
 
 def parse_args():
@@ -50,13 +49,6 @@ def parse_args():
     parser.add_argument('--dropout_rate', type=float, default=0.0)
     parser.add_argument('--num_layers', type=int, help='Number of layers', default=None)
     parser.add_argument('--disable_tqdm', action='store_true')
-    parser.add_argument('--augment', action='store_true', help="Augment base models via permutations")
-
-    # init
-    parser.add_argument('--in_factor', type=float, default=1.0, help="muP scale factor for input")
-    parser.add_argument('--out_factor', type=float, default=1.0, help="muP scale factor for output")
-    parser.add_argument('--attn_factor', type=float, default=1.0, help="muP scale factor for attention")
-    parser.add_argument('--init_scale', type=float, default=1.0)
 
     # training
     parser.add_argument('--max_steps', type=int, default=np.inf)
@@ -77,8 +69,14 @@ def parse_args():
     parser.add_argument('--adam_eps', type=float, default=1e-8)
 
     # data
-    parser.add_argument('--ndata', type=int, 
-                        help='Number of training datapoints', default=20_000)
+    parser.add_argument('--ndata', type=int, default=20_000,
+                        help='Number of training datapoints (programs)')
+    parser.add_argument('--split_layers', action='store_true',
+                        help='Load individual layers of base models.')
+    parser.add_argument('--max_rasp_len', type=int, default=None,
+                        help='Maximum length of RASP tokens per datapoint.')
+    parser.add_argument('--max_weights_len', type=int, default=None,
+                        help='Maximum number of parameters per datapoint.')
 
     # wandb
     parser.add_argument('--use_wandb', action='store_true')
@@ -93,16 +91,19 @@ def parse_args():
     if args.wandb_run_name is not None:
         args.wandb_run_name += str(int(time()))
 
-    logger.info("Args:\n%s", pprint.pformat(vars(args)))
-    logger.info("\n")
-    data_logger.info("Args:\n%s", pprint.pformat(vars(args)))
-    data_logger.info("\n")
-
+    if args.split_layers:
+        args.max_rasp_len = MAX_RASP_LENGTH
+        args.max_weights_len = MAX_WEIGHTS_LENGTH
+    else:
+        # the following is assuming per layer maximums of 32 and 8192
+        # note the sum should be a multiple of d_model
+        args.max_rasp_len = 128
+        args.max_weights_len = 128_000
     return args
 
 
-
-def load_data(args, rng: np.random.Generator) -> tuple[list, list, list]:
+def load_data(args, rng: np.random.Generator, include_test: bool = False,
+) -> tuple[dict, dict, dict]:
     data = data_utils.load_and_process_data(
         rng=rng,
         loaddir=FULL_DATA_DIR,
@@ -110,46 +111,54 @@ def load_data(args, rng: np.random.Generator) -> tuple[list, list, list]:
         shuffle=True,
         name="train",
         d_model=args.d_model,
-        max_rasp_len=MAX_RASP_LENGTH,
-        max_weights_len=MAX_WEIGHTS_LENGTH,
+        max_rasp_len=args.max_rasp_len,
+        max_weights_len=args.max_weights_len,
+        split_layers=args.split_layers,
     )
 
     train_data, val_data = data_utils.split_dict_data(
         data, val_ratio=VAL_DATA_RATIO)
 
-    test_datasets = {
-        name: data_utils.load_and_process_data(
-            rng=None,
-            max_data=None,
-            shuffle=False,
-            name=name,
-            d_model=args.d_model,
-            max_rasp_len=MAX_RASP_LENGTH,
-            max_weights_len=MAX_WEIGHTS_LENGTH,
-        ) for name in ["lib", "test"]
-    }
-
 #    # normalize weights
-    w_std = train_data["weights"].std()
+    w_std = train_data["weights"].std(dtype=np.float64)
     logger.info(f"Weight std before normalization: {w_std}")
     train_data['weights'] = train_data['weights'] / w_std
     val_data['weights'] = val_data['weights'] / w_std
+    
+    if include_test:
+        # TODO: only want to load test data, not everything
+        test_datasets = {
+            name: data_utils.load_and_process_data(
+                rng=None,
+                loaddir=FULL_DATA_DIR,
+                max_data=None,
+                shuffle=False,
+                name=name,
+                d_model=args.d_model,
+                max_rasp_len=args.max_rasp_len,
+                max_weights_len=args.max_weights_len,
+                split_layers=args.split_layers,
+            ) for name in ["lib"] #, "test"]
+        }
 
-    for v in test_datasets.values():
-        v['weights'] = v['weights'] / w_std
+        for v in test_datasets.values():
+            v['weights'] = v['weights'] / w_std
+    else:
+        test_datasets = {}
 
     return train_data, val_data, test_datasets
 
 
 def _get_model(args):
-    weight_len = MAX_WEIGHTS_LENGTH/args.d_model
+    weight_len = args.max_weights_len / args.d_model
+
     assert weight_len.is_integer()
     weight_len = int(weight_len)
-    seq_len = MAX_RASP_LENGTH + weight_len
+    seq_len = args.max_rasp_len + weight_len
 
     config = TransformerConfig(
         weight_len=weight_len,
-        rasp_tok_len=MAX_RASP_LENGTH,
+        rasp_tok_len=args.max_rasp_len,
         vocab_size=vocab.size,
         output_vocab_size=vocab.size,
         emb_dim=args.d_model,
@@ -165,7 +174,7 @@ def _get_model(args):
     return Transformer(config=config)
 
 
-def init(rng, args, train_data) -> tuple[Transformer, Updater, dict]:
+def init(rng, args, train_data) -> tuple[Transformer, Updater, dict, "Run"]:
     """Initialize the model and set up the optimizer."""
     model = _get_model(args)
     @optax.inject_hyperparams
@@ -182,7 +191,8 @@ def init(rng, args, train_data) -> tuple[Transformer, Updater, dict]:
             opt,
         )
     
-    num_steps = len(train_data['tokens']) // args.bs
+    num_steps_per_epoch = len(train_data['tokens']) // args.bs
+    num_steps = min(num_steps_per_epoch * args.max_epochs, args.max_steps)
 
     schedule = schedules.constant_with_warmup_and_cooldown(
         args.lr,
@@ -202,24 +212,11 @@ def init(rng, args, train_data) -> tuple[Transformer, Updater, dict]:
     }
     subrng, rng = jax.random.split(rng)
     state = updater.init_train_state(subrng, dummy_batch)
-    return model, updater, state
 
-
-def main():
-    args = parse_args()
-    rng = jax.random.PRNGKey(args.seed)
-    np_rng = np.random.default_rng()
-
-    train_data, val_data, test_datasets = load_data(args, np_rng)
-
-    subrng, rng = jax.random.split(rng)
-    model, updater, state = init(subrng, args, train_data)
-    metrics_logger = Logger()
-
-
+    # wandb 
     run = wandb.init(
         mode="online" if args.use_wandb else "disabled",
-        project=f"inverse-tracr",
+        project=f"decompile-tracr",
         tags=args.tags,
         notes=args.notes,
         name=args.wandb_run_name,
@@ -238,6 +235,62 @@ def main():
             "save_checkpoint": args.save_checkpoint,
         },
     )
+    return model, updater, state, run
+
+
+def log_metadata(args, train_data, val_data, test_datasets, model, 
+                 state, checkpoint_savedir, checkpoint_savename
+) -> None:
+    logger.info("Args:\n%s", pprint.pformat(vars(args)))
+    logger.info("\n")
+    data_logger.info("Args:\n%s", pprint.pformat(vars(args)))
+    data_logger.info("\n")
+
+    MAX_INDEX = 10_000
+    sample_weights = train_data['weights'][:MAX_INDEX]
+    sample_tokens = train_data['tokens'][:MAX_INDEX]
+    assert isinstance(train_data['weights'], np.ndarray)
+    assert isinstance(train_data['tokens'], np.ndarray)
+    logger.info(f"Tags: {args.tags}")
+    logger.info("Number of training examples: "
+                f"{len(train_data['tokens']):,}.")
+    logger.info("Number of validation examples: "
+                f"{len(val_data['tokens']):,}.")
+
+    for name, test_data in test_datasets.items():
+        logger.info(f"Number of test examples in {name}: "
+                    f"{len(test_data['tokens']):,}.")
+
+    logger.info(f"Number of parameters in meta-model: "
+                f"{count_params(state.params) / 1e6} Million")
+    logger.info(f"Data shapes: weights: {train_data['weights'].shape}, "
+                f"tokens: {train_data['tokens'].shape}")
+    logger.info(f"Train data (weights) mean: {sample_weights.mean(dtype=np.float64)}, "
+                f"std: {sample_weights.std(dtype=np.float64)}")
+
+    for test_data in test_datasets.values():
+        logger.info(f"Test data (weights) mean: {test_data['weights'][:MAX_INDEX].mean(dtype=np.float64)}, "
+                    f"std: {test_data['weights'][:MAX_INDEX].std()}")
+
+    logger.info(f"Percent of weights zero: "
+                f"{round(100 * (sample_weights == 0).sum() / sample_weights.size, 2)}%")
+    logger.info(f"Expected sequence length: {model.config.max_len}.")
+    if args.save_checkpoint:
+        logger.info(f"Saving final checkpoint to {checkpoint_savedir}/{checkpoint_savename}.")
+    print()
+    return None
+
+
+def main():
+    args = parse_args()
+    rng = jax.random.PRNGKey(args.seed)
+    np_rng = np.random.default_rng()
+
+    train_data, val_data, test_datasets = load_data(args, np_rng)
+
+    subrng, rng = jax.random.split(rng)
+    model, updater, state, run = init(subrng, args, train_data)
+    metrics_logger = Logger()
 
     checkpoint_savedir = epath.Path(output_dir) / "mm-checkpoints" \
         / "decompile"
@@ -247,42 +300,26 @@ def main():
         checkpoint_savename = f"run_{int(time())}"
 
 
-    logger.info(f"Tags: {args.tags}")
-    logger.info("Number of training examples: "
-                f"{len(train_data['tokens'])}.")
-    logger.info("Number of validation examples: "
-                f"{len(val_data['tokens'])}.")
-    for name, test_data in test_datasets.items():
-        logger.info(f"Number of test examples in {name}: "
-                    f"{len(test_data['tokens'])}.")
-    logger.info(f"Number of parameters in meta-model: "
-                f"{count_params(state.params) / 1e6} Million")
-    logger.info(f"Data shapes: weights: {train_data['weights'].shape}, "
-                f"tokens: {train_data['tokens'].shape}")
-    logger.info(f"Train data (weights) mean: {train_data['weights'].mean()}, "
-                f"std: {train_data['weights'].std()}")
-    for test_data in test_datasets.values():
-        logger.info(f"Test data (weights) mean: {test_data['weights'].mean()}, "
-                    f"std: {test_data['weights'].std()}")
-    logger.info(f"Percent of weights zero: "
-                f"{round(100 * (train_data['weights'] == 0).sum() / train_data['weights'].size, 2)}%")
-    logger.info(f"Expected sequence length: {model.config.max_len}.")
-    if args.save_checkpoint:
-        logger.info(f"Saving final checkpoint to {checkpoint_savedir}/{checkpoint_savename}.")
+    log_metadata(args, train_data, val_data, test_datasets, model,
+                    state, checkpoint_savedir, checkpoint_savename)
 
 
     def train(state):
         """Train for one epoch. Return updated state."""
         # TODO: shuffle train data
+#        assert not np.any(np.isnan(train_data['weights']))
+#        assert not np.any(np.isnan(train_data['tokens']))
+#        assert not np.isnan(jax.flatten_util.ravel_pytree(state.params)[0]).any()
         stop_training = False
         for batch in tqdm(
                 data_iterator(train_data, args.bs, stacked_tree=True, skip_last=True),
                 disable=disable_tqdm,
                 desc="Training",
-            ):
+        ):
             chex.assert_shape(batch["weights"], 
-                              (args.bs, MAX_WEIGHTS_LENGTH/args.d_model, args.d_model))
-            chex.assert_shape(batch["tokens"], (args.bs, MAX_RASP_LENGTH)) 
+                              (args.bs, None, None))
+            chex.assert_shape(batch["tokens"], (args.bs, None)) 
+
             state, train_metrics = updater.update(state, batch)
             metrics_logger.write(state, train_metrics, name="train")
 
@@ -314,7 +351,7 @@ def main():
             preds: ArrayLike, 
             name: str,
             snip_at: int = 10,
-        ):
+    ):
         """Args:
             - tokens: 1D array of ground-truth tokens
             - preds: 1D array of predictions
@@ -344,15 +381,13 @@ def main():
         for i, batch in enumerate(
                     data_iterator(data, args.bs, stacked_tree=True)):
 
-            chex.assert_shape(batch["tokens"], (None, MAX_RASP_LENGTH)) 
+            chex.assert_shape(batch["tokens"], (None, None)) 
             chex.assert_shape(batch["weights"],
-                              (None, MAX_WEIGHTS_LENGTH/args.d_model, args.d_model))
+                              (None, None, None))
 
             state, val_metrics, aux = updater.compute_val_metrics(
                 state, batch, name=name)
             metrics_logger.write(state, val_metrics, name=name)
-
-            mask = np.array(aux['mask'], dtype=bool)
 
             for k in out.keys():
                 out[k].append(aux[k])
