@@ -1,4 +1,5 @@
 from collections import defaultdict
+from typing import Optional
 
 import numpy as np
 import jax
@@ -42,10 +43,15 @@ class Updater:
             out.update(aux["metrics"])
         return out, aux
 
-    def init_train_state(self, rng: ArrayLike, inputs: ArrayLike) -> dict:
+    def init_train_state(self, rng: ArrayLike, inputs: ArrayLike,
+                         init_params: Optional[dict] = None) -> dict:
         out_rng, subkey = jax.random.split(rng)
-        v = self.model.init(subkey, inputs, is_training=False)
-        opt_state = self.opt.init(v["params"])
+        if not init_params:
+            v = self.model.init(subkey, inputs, is_training=False)
+            opt_state = self.opt.init(v["params"])
+        else:
+            v = {"params": init_params}
+            opt_state = self.opt.init(init_params)
         if list(v.keys()) != ["params"]:
             raise ValueError("Expected model.init to return a dict with "
                 f"a single key 'params'. Instead got {v.keys()}.")

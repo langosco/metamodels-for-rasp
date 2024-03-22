@@ -23,7 +23,7 @@ def setup_data_logger(level=logging.DEBUG, logfile="train.log"):
     if not logger.hasHandlers():
         file_handler = logging.FileHandler(logfile)
         file_handler.setLevel(level)
-        formatter = logging.Formatter('%(asctime)s [%(levelname)s]: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        formatter = logging.Formatter('%(message)s')
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
 

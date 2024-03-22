@@ -1,4 +1,5 @@
 from time import time
+from datetime import datetime
 import os
 import pprint
 import json
@@ -38,6 +39,7 @@ VAL_DATA_RATIO = 0.1
 MAX_RASP_LENGTH = dataset_config.MAX_RASP_LENGTH
 MAX_WEIGHTS_LENGTH = dataset_config.MAX_WEIGHTS_LENGTH
 FULL_DATA_DIR = dataset_config.full_dataset_dir
+checkpoint_savedir = epath.Path(output_dir) / "mm-checkpoints" / "decompile"
 
 
 def parse_args():
@@ -57,6 +59,8 @@ def parse_args():
     parser.add_argument('--save_checkpoint', action='store_true', 
             help='Save checkpoint at the end of training')
     parser.add_argument('--val_every', type=int, default=5)
+    parser.add_argument('--restore_checkpoint_from', type=str, default=None,
+                        help='Checkpoint name to restore from')
 
     # adam
     parser.add_argument('--lr', type=float, help='Learning rate', 
@@ -87,6 +91,8 @@ def parse_args():
     args = parser.parse_args()
 
     args.tags.append("HPC" if on_cluster else "local")
+    if args.restore_checkpoint_from is not None:
+        args.tags.append("continued")
 
     if args.wandb_run_name is not None:
         args.wandb_run_name += str(int(time()))
@@ -96,8 +102,8 @@ def parse_args():
         args.max_weights_len = MAX_WEIGHTS_LENGTH
     else:
         # the following is assuming per layer maximums of 32 and 8192
-        # note the sum should be a multiple of d_model
-        args.max_rasp_len = 128
+        # note max_weights_len should be a multiple of d_model
+        args.max_rasp_len = 120
         args.max_weights_len = 128_000
     return args
 
@@ -176,7 +182,19 @@ def _get_model(args):
 
 def init(rng, args, train_data) -> tuple[Transformer, Updater, dict, "Run"]:
     """Initialize the model and set up the optimizer."""
-    model = _get_model(args)
+    if args.restore_checkpoint_from is None:
+        model = _get_model(args)
+        restored_params = None
+    else:
+        checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+        restored_params, model_config = checkpointer.restore(
+            checkpoint_savedir / args.restore_checkpoint_from)
+        model_config = {k: v for k, v in model_config.items() if v is not None}
+        model_config = {k: v.item() for k, v in model_config.items()}
+        model = Transformer(config=TransformerConfig(**model_config))
+        logger.info(f"Restored params from {args.restore_checkpoint_from}."
+                    " This overrides model config args.")
+
     @optax.inject_hyperparams
     def optimizer(lr: float, wd: float, clip_value: float) -> optax.GradientTransformation:
         opt = optax.adamw(
@@ -206,12 +224,13 @@ def init(rng, args, train_data) -> tuple[Transformer, Updater, dict, "Run"]:
     updater = Updater(opt=opt, model=model, loss_fn=loss_fn)
 
     # init
+    subrng, rng = jax.random.split(rng)
     dummy_batch = {
         "weights": train_data['weights'][:1],
         "tokens": train_data['tokens'][:1],
     }
-    subrng, rng = jax.random.split(rng)
-    state = updater.init_train_state(subrng, dummy_batch)
+    state = updater.init_train_state(subrng, dummy_batch, 
+                                init_params=restored_params)
 
     # wandb 
     run = wandb.init(
@@ -239,16 +258,17 @@ def init(rng, args, train_data) -> tuple[Transformer, Updater, dict, "Run"]:
 
 
 def log_metadata(args, train_data, val_data, test_datasets, model, 
-                 state, checkpoint_savedir, checkpoint_savename
-) -> None:
-    logger.info("Args:\n%s", pprint.pformat(vars(args)))
+                 state, checkpoint_savename) -> None:
+    logger.info("Args:\n%s\n", pprint.pformat(vars(args)))
     logger.info("\n")
-    data_logger.info("Args:\n%s", pprint.pformat(vars(args)))
-    data_logger.info("\n")
+    if args.restore_checkpoint_from is not None:
+        logger.info("Model config restored from checkpoint (overrides args):"
+                    f"\n{pprint.pformat(model.config)}\n")
+
+    data_logger.info("Args:\n%s\n", pprint.pformat(vars(args)))
 
     MAX_INDEX = 10_000
     sample_weights = train_data['weights'][:MAX_INDEX]
-    sample_tokens = train_data['tokens'][:MAX_INDEX]
     assert isinstance(train_data['weights'], np.ndarray)
     assert isinstance(train_data['tokens'], np.ndarray)
     logger.info(f"Tags: {args.tags}")
@@ -292,16 +312,13 @@ def main():
     model, updater, state, run = init(subrng, args, train_data)
     metrics_logger = Logger()
 
-    checkpoint_savedir = epath.Path(output_dir) / "mm-checkpoints" \
-        / "decompile"
     if args.use_wandb:
         checkpoint_savename = run.name
     else:
         checkpoint_savename = f"run_{int(time())}"
 
-
     log_metadata(args, train_data, val_data, test_datasets, model,
-                    state, checkpoint_savedir, checkpoint_savename)
+                    state, checkpoint_savename)
 
 
     def train(state):
@@ -315,6 +332,7 @@ def main():
                 data_iterator(train_data, args.bs, stacked_tree=True, skip_last=True),
                 disable=disable_tqdm,
                 desc="Training",
+                total=len(train_data['tokens']) // args.bs,
         ):
             chex.assert_shape(batch["weights"], 
                               (args.bs, None, None))
@@ -349,9 +367,8 @@ def main():
     def log_rasp_snippet(
             tokens: ArrayLike, 
             preds: ArrayLike, 
-            name: str,
             snip_at: int = 10,
-    ):
+    ) -> None:
         """Args:
             - tokens: 1D array of ground-truth tokens
             - preds: 1D array of predictions
@@ -362,7 +379,9 @@ def main():
         rasp_snippet = tokenizer.decode(tokens[:snip_at])
         decoded_preds = tokenizer.decode(preds[:snip_at])
         try:
-            eos_idx = rasp_snippet.index("EOS") + 1
+            eos_idx = max(loc for loc, val in enumerate(rasp_snippet) 
+                          if val == 'EOS') + 1
+#            eos_idx = rasp_snippet.index("EOS") + 1
         except ValueError:
             eos_idx = len(decoded_preds)
 
@@ -370,14 +389,17 @@ def main():
         rasp_snippet = rasp_snippet[:eos_idx]
 
         rasp_snippet = color_sequence(rasp_snippet, correct_preds)
-        data_logger.info(f"{name}: {rasp_snippet} (true)")
-
         decoded_preds = decoded_preds[:eos_idx]
-        data_logger.info(f"{name}: {decoded_preds} (preds)")
+
+        data_logger.info("true: " + " ".join(rasp_snippet))
+        data_logger.info("pred: " + " ".join(decoded_preds))
+        return None
 
 
     def compute_metrics(state, data, name="test"):
         out = dict(mask=[], correct_preds=[], program_id=[])
+        data_logger.info(datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " - "
+                         f"Logging step {state.step}. Data: {name}")
         for i, batch in enumerate(
                     data_iterator(data, args.bs, stacked_tree=True)):
 
@@ -392,19 +414,20 @@ def main():
             for k in out.keys():
                 out[k].append(aux[k])
         
-            if i < 3:
-                for idx in range(15):
+            if i < 10:
+                for idx in range(20):
                     try:
                         log_rasp_snippet(
                             tokens=batch['tokens'][idx],
                             preds=aux['preds'][idx],
-                            name=name,
-                            snip_at=15,
+                            snip_at=25,
                         )
                     except IndexError:
                         break
 
-        data_logger.info("\n")
+        data_logger.info(datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " - "
+                         f"Done logging snippets.")
+        data_logger.info("\n=======================================\n\n")
 
         out = {k: np.concatenate(v) for k, v in out.items()}
 
