@@ -301,6 +301,40 @@ def log_metadata(args, train_data, val_data, test_datasets, model,
     return None
 
 
+def log_rasp_snippet(
+        tokens: ArrayLike, 
+        preds: ArrayLike, 
+        start: int = 0,
+        end: int = 25,
+) -> None:
+    """Args:
+        - tokens: 1D array of ground-truth tokens
+        - preds: 1D array of predictions
+        - name: 'train', 'val', or 'test'
+        - start: start token index
+        - end: end token index
+    """
+    which_correct = (tokens == preds)[start:end]
+    true = tokenizer.decode(tokens[start:end])
+    pred = tokenizer.decode(preds[start:end])
+
+#    try:
+#        eos_idx = max(loc for loc, val in enumerate(true) 
+#                        if val == 'EOS') + 1
+##            eos_idx = rasp_snippet.index("EOS") + 1
+#    except ValueError:
+#        eos_idx = len(true)
+#
+#    which_correct = which_correct[:eos_idx]
+#    pred, true = pred[:eos_idx], true[:eos_idx]
+
+    pred = color_sequence(pred, which_correct)
+
+    data_logger.info(f"pred ({start}-{end}): " + " ".join(pred))
+    data_logger.info(f"true ({start}-{end}): " + " ".join(true))
+    return None
+
+
 def main():
     args = parse_args()
     rng = jax.random.PRNGKey(args.seed)
@@ -364,42 +398,10 @@ def main():
         return state, stop_training
 
 
-    def log_rasp_snippet(
-            tokens: ArrayLike, 
-            preds: ArrayLike, 
-            snip_at: int = 10,
-    ) -> None:
-        """Args:
-            - tokens: 1D array of ground-truth tokens
-            - preds: 1D array of predictions
-            - name: 'train', 'val', or 'test'
-            - snip_at: number of tokens to include in snippet
-        """
-        correct_preds = (tokens == preds)[:snip_at]
-        rasp_snippet = tokenizer.decode(tokens[:snip_at])
-        decoded_preds = tokenizer.decode(preds[:snip_at])
-        try:
-            eos_idx = max(loc for loc, val in enumerate(rasp_snippet) 
-                          if val == 'EOS') + 1
-#            eos_idx = rasp_snippet.index("EOS") + 1
-        except ValueError:
-            eos_idx = len(decoded_preds)
-
-        correct_preds = correct_preds[:eos_idx]
-        rasp_snippet = rasp_snippet[:eos_idx]
-
-        rasp_snippet = color_sequence(rasp_snippet, correct_preds)
-        decoded_preds = decoded_preds[:eos_idx]
-
-        data_logger.info("true: " + " ".join(rasp_snippet))
-        data_logger.info("pred: " + " ".join(decoded_preds))
-        return None
-
-
     def compute_metrics(state, data, name="test"):
         out = dict(mask=[], correct_preds=[], program_id=[])
         data_logger.info(datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " - "
-                         f"Logging step {state.step}. Data: {name}")
+                         f"Logging step {state.step}. Data: {name}.")
         for i, batch in enumerate(
                     data_iterator(data, args.bs, stacked_tree=True)):
 
@@ -415,19 +417,21 @@ def main():
                 out[k].append(aux[k])
         
             if i < 10:
+                data_logger.info(f"Step {state.step}, {name} batch {i}:")
                 for idx in range(20):
                     try:
+                        data_logger.info(f"Example {idx}:")
                         log_rasp_snippet(
                             tokens=batch['tokens'][idx],
                             preds=aux['preds'][idx],
-                            snip_at=25,
+                            end=35,
                         )
                     except IndexError:
                         break
 
         data_logger.info(datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " - "
                          f"Done logging snippets.")
-        data_logger.info("\n=======================================\n\n")
+        data_logger.info("\n=======================================\n")
 
         out = {k: np.concatenate(v) for k, v in out.items()}
 
