@@ -33,7 +33,7 @@ from decompile_tracr.tokenizing import tokenizer
 #jax.config.update("jax_debug_nans", True)
 
 logger = setup_logger(__name__)
-data_logger = setup_data_logger()
+data_logger = setup_data_logger(logfile="train.log")
 START_TIME = time()
 VAL_DATA_RATIO = 0.1
 MAX_RASP_LENGTH = dataset_config.MAX_RASP_LENGTH
@@ -73,7 +73,7 @@ def parse_args():
     parser.add_argument('--adam_eps', type=float, default=1e-8)
 
     # data
-    parser.add_argument('--ndata', type=int, default=20_000,
+    parser.add_argument('--ndata', type=int, default=120_000,
                         help='Number of training datapoints (programs)')
     parser.add_argument('--split_layers', action='store_true',
                         help='Load individual layers of base models.')
@@ -81,6 +81,7 @@ def parse_args():
                         help='Maximum length of RASP tokens per datapoint.')
     parser.add_argument('--max_weights_len', type=int, default=None,
                         help='Maximum number of parameters per datapoint.')
+    parser.add_argument('--symlog', action='store_true')
 
     # wandb
     parser.add_argument('--use_wandb', action='store_true')
@@ -98,24 +99,22 @@ def parse_args():
         args.wandb_run_name += str(int(time()))
 
     if args.split_layers:
+        # note max_weights_len should be a multiple of d_model
+        args.max_rasp_len = MAX_WEIGHTS_LENGTH // 4
+        args.max_weights_len = MAX_RASP_LENGTH // 4
+    else:
         args.max_rasp_len = MAX_RASP_LENGTH
         args.max_weights_len = MAX_WEIGHTS_LENGTH
-    else:
-        # the following is assuming per layer maximums of 32 and 8192
-        # note max_weights_len should be a multiple of d_model
-        args.max_rasp_len = 120
-        args.max_weights_len = 128_000
     return args
 
 
 def load_data(args, rng: np.random.Generator, include_test: bool = False,
 ) -> tuple[dict, dict, dict]:
-    data = data_utils.load_and_process_data(
+    data = data_utils.load_dataset_for_model_input(
         rng=rng,
         loaddir=FULL_DATA_DIR,
         max_data=args.ndata,
         shuffle=True,
-        name="train",
         d_model=args.d_model,
         max_rasp_len=args.max_rasp_len,
         max_weights_len=args.max_weights_len,
@@ -124,6 +123,10 @@ def load_data(args, rng: np.random.Generator, include_test: bool = False,
 
     train_data, val_data = data_utils.split_dict_data(
         data, val_ratio=VAL_DATA_RATIO)
+    
+    if args.symlog:
+        train_data['weights'] = data_utils.symlog(train_data['weights'])
+        val_data['weights'] = data_utils.symlog(val_data['weights'])
 
 #    # normalize weights
     w_std = train_data["weights"].std(dtype=np.float64)
@@ -134,12 +137,11 @@ def load_data(args, rng: np.random.Generator, include_test: bool = False,
     if include_test:
         # TODO: only want to load test data, not everything
         test_datasets = {
-            name: data_utils.load_and_process_data(
+            name: data_utils.load_dataset_for_model_input(
                 rng=None,
                 loaddir=FULL_DATA_DIR,
                 max_data=None,
                 shuffle=False,
-                name=name,
                 d_model=args.d_model,
                 max_rasp_len=args.max_rasp_len,
                 max_weights_len=args.max_weights_len,
@@ -148,6 +150,8 @@ def load_data(args, rng: np.random.Generator, include_test: bool = False,
         }
 
         for v in test_datasets.values():
+            if args.symlog:
+                v['weights'] = data_utils.symlog(v['weights'])
             v['weights'] = v['weights'] / w_std
     else:
         test_datasets = {}
@@ -252,6 +256,7 @@ def init(rng, args, train_data) -> tuple[Transformer, Updater, dict, "Run"]:
             "slurm_job_id": os.environ.get('SLURM_JOB_ID'),
             "slurm_job_name": os.environ.get('SLURM_JOB_NAME'),
             "save_checkpoint": args.save_checkpoint,
+            "dataset": "nsops=10",
         },
     )
     return model, updater, state, run
@@ -296,7 +301,7 @@ def log_metadata(args, train_data, val_data, test_datasets, model,
                 f"{round(100 * (sample_weights == 0).sum() / sample_weights.size, 2)}%")
     logger.info(f"Expected sequence length: {model.config.max_len}.")
     if args.save_checkpoint:
-        logger.info(f"Saving final checkpoint to {checkpoint_savedir}/{checkpoint_savename}.")
+        logger.info(f"When training is completed, save final checkpoint to {checkpoint_savedir}/{checkpoint_savename}.")
     print()
     return None
 
@@ -314,20 +319,11 @@ def log_rasp_snippet(
         - start: start token index
         - end: end token index
     """
+    pad_start = np.where(tokens == vocab.pad_id)[0][0]
+    end = min(end, pad_start)  # cut off at first pad token
     which_correct = (tokens == preds)[start:end]
     true = tokenizer.decode(tokens[start:end])
     pred = tokenizer.decode(preds[start:end])
-
-#    try:
-#        eos_idx = max(loc for loc, val in enumerate(true) 
-#                        if val == 'EOS') + 1
-##            eos_idx = rasp_snippet.index("EOS") + 1
-#    except ValueError:
-#        eos_idx = len(true)
-#
-#    which_correct = which_correct[:eos_idx]
-#    pred, true = pred[:eos_idx], true[:eos_idx]
-
     pred = color_sequence(pred, which_correct)
 
     data_logger.info(f"pred ({start}-{end}): " + " ".join(pred))
@@ -440,9 +436,10 @@ def main():
             correct_preds=out['correct_preds'],
             mask=out['mask'],
         )
+        reconstruction_fracs = np.array(reconstruction_fracs)
 
         program_acc = np.mean(reconstruction_fracs == 1.0)
-        program_acc_50 = np.mean(np.array(reconstruction_fracs) > 0.5)
+        program_acc_50 = np.mean(reconstruction_fracs > 0.5)
 
         metrics_logger.flush_mean(
             state, 
@@ -452,7 +449,8 @@ def main():
                 "epoch": epoch,
                 f"{name}/program_accuracy": program_acc,
                 f"{name}/program_accuracy_50": program_acc_50,
-                f"{name}/program_accuracy_90": np.mean(np.array(reconstruction_fracs) > 0.9),
+                f"{name}/program_accuracy_90": np.mean(reconstruction_fracs > 0.9),
+                f"{name}/program_frac_correct": np.mean(reconstruction_fracs),
             }
         )
             
