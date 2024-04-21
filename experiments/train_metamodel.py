@@ -420,7 +420,7 @@ def main():
                         log_rasp_snippet(
                             tokens=batch['tokens'][idx],
                             preds=aux['preds'][idx],
-                            end=35,
+                            end=100,
                         )
                     except IndexError:
                         break
@@ -450,7 +450,10 @@ def main():
                 f"{name}/program_accuracy": program_acc,
                 f"{name}/program_accuracy_50": program_acc_50,
                 f"{name}/program_accuracy_90": np.mean(reconstruction_fracs > 0.9),
+                f"{name}/program_accuracy_95": np.mean(reconstruction_fracs > 0.95),
+                f"{name}/program_accuracy_98": np.mean(reconstruction_fracs > 0.98),
                 f"{name}/program_frac_correct": np.mean(reconstruction_fracs),
+                f"{name}/program_frac_correct_std": np.std(reconstruction_fracs),
             }
         )
             
