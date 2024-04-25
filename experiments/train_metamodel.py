@@ -1,5 +1,6 @@
 from time import time
 from datetime import datetime
+import functools
 import os
 import pprint
 import json
@@ -15,6 +16,7 @@ import wandb
 import orbax.checkpoint
 from jax.typing import ArrayLike
 from etils import epath
+import einops
 
 from nn_utils import schedules
 from metamodels_for_rasp import on_cluster, output_dir, interactive
@@ -38,7 +40,7 @@ START_TIME = time()
 VAL_DATA_RATIO = 0.1
 MAX_RASP_LENGTH = dataset_config.MAX_RASP_LENGTH
 MAX_WEIGHTS_LENGTH = dataset_config.MAX_WEIGHTS_LENGTH
-FULL_DATA_DIR = dataset_config.full_dataset_dir
+FULL_DATA_FILE = dataset_config.data_dir / "full.h5"
 checkpoint_savedir = epath.Path(output_dir) / "mm-checkpoints" / "decompile"
 
 
@@ -111,52 +113,43 @@ def parse_args():
 def load_data(args, rng: np.random.Generator, include_test: bool = False,
 ) -> tuple[dict, dict, dict]:
     data = data_utils.load_dataset_for_model_input(
-        rng=rng,
-        loaddir=FULL_DATA_DIR,
-        max_data=args.ndata,
-        shuffle=True,
-        d_model=args.d_model,
-        max_rasp_len=args.max_rasp_len,
-        max_weights_len=args.max_weights_len,
-        split_layers=args.split_layers,
+        loadfile=FULL_DATA_FILE,
+        ndata=args.ndata,
     )
+    data['program_id'] = np.arange(len(data['tokens']))
 
+    test_datasets = {}
+    if include_test:
+        raise NotImplementedError('TODO: load test datasets separately.')
+
+    with jax.default_device(jax.devices("cpu")[0]):
+        train_data, val_data, stats = _process_data(data, args.symlog, args.d_model)
+        train_data = {k: np.asarray(v) for k, v in train_data.items()}
+        val_data = {k: np.asarray(v) for k, v in val_data.items()}
+    logger.info(f"Weight mean and std before normalization: {stats}")
+    return train_data, val_data, test_datasets
+
+
+@functools.partial(jax.jit, static_argnames=("symlog", "d_model"), donate_argnames=('data',))
+def _process_data(data: dict, symlog: bool, d_model: int) -> dict:
+    # TODO: shuffle data?
+    # TODO: make processing less memory intensive
     train_data, val_data = data_utils.split_dict_data(
         data, val_ratio=VAL_DATA_RATIO)
     
-    if args.symlog:
+    if symlog:
         train_data['weights'] = data_utils.symlog(train_data['weights'])
         val_data['weights'] = data_utils.symlog(val_data['weights'])
 
 #    # normalize weights
     w_std = train_data["weights"].std(dtype=np.float64)
-    logger.info(f"Weight std before normalization: {w_std}")
-    train_data['weights'] = train_data['weights'] / w_std
-    val_data['weights'] = val_data['weights'] / w_std
-    
-    if include_test:
-        # TODO: only want to load test data, not everything
-        test_datasets = {
-            name: data_utils.load_dataset_for_model_input(
-                rng=None,
-                loaddir=FULL_DATA_DIR,
-                max_data=None,
-                shuffle=False,
-                d_model=args.d_model,
-                max_rasp_len=args.max_rasp_len,
-                max_weights_len=args.max_weights_len,
-                split_layers=args.split_layers,
-            ) for name in ["lib"] #, "test"]
-        }
-
-        for v in test_datasets.values():
-            if args.symlog:
-                v['weights'] = data_utils.symlog(v['weights'])
-            v['weights'] = v['weights'] / w_std
-    else:
-        test_datasets = {}
-
-    return train_data, val_data, test_datasets
+    w_mean = train_data["weights"].mean(dtype=np.float64)
+    train_data['weights'] = (train_data['weights'] - w_mean) / w_std
+    val_data['weights'] = (val_data['weights'] - w_mean) / w_std
+    # reshape for model input
+    train_data['weights'] = einops.rearrange(train_data['weights'], 'b (s d) -> b s d', d=d_model)
+    val_data['weights'] = einops.rearrange(val_data['weights'], 'b (s d) -> b s d', d=d_model)
+    return train_data, val_data, (w_mean, w_std)
 
 
 def _get_model(args):
@@ -230,8 +223,8 @@ def init(rng, args, train_data) -> tuple[Transformer, Updater, dict, "Run"]:
     # init
     subrng, rng = jax.random.split(rng)
     dummy_batch = {
-        "weights": train_data['weights'][:1],
-        "tokens": train_data['tokens'][:1],
+        "weights": np.ones((1, *train_data['weights'].shape[1:])),
+        "tokens": np.ones((1, *train_data['tokens'].shape[1:])),
     }
     state = updater.init_train_state(subrng, dummy_batch, 
                                 init_params=restored_params)
