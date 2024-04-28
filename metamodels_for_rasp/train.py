@@ -139,7 +139,7 @@ class Logger:
             means.update(extra_metrics)
         
         # log
-        wandb.log(means, step=state.step)
+        wandb.log(means, step=int(state.step))
         if verbose:
             print_metrics(means)
         
@@ -148,7 +148,7 @@ class Logger:
 
     def write(self, state, metrics, name="train"):
         """Add metrics to self.metrics[name]"""
-        metrics["step"] = int(state.step)
+        metrics["step"] = state.step
         self.metrics[name].append(metrics)
     
     def get_metrics(self, name="train", metric="train/loss"):

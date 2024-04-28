@@ -1,4 +1,4 @@
-from time import time
+from time import time, sleep
 from datetime import datetime
 import functools
 import os
@@ -7,6 +7,8 @@ import json
 from dataclasses import asdict
 import argparse
 from tqdm import tqdm
+import h5py
+import itertools
 
 import jax
 import optax
@@ -27,6 +29,7 @@ from metamodels_for_rasp.utils import count_params, data_iterator, color_sequenc
 
 from decompile_tracr.dataset import config as dataset_config
 from decompile_tracr.dataset import data_utils
+from decompile_tracr.dataset import dataloading
 from decompile_tracr.tokenizing import vocab
 from decompile_tracr.tokenizing import tokenizer
 
@@ -75,7 +78,7 @@ def parse_args():
     parser.add_argument('--adam_eps', type=float, default=1e-8)
 
     # data
-    parser.add_argument('--ndata', type=int, default=120_000,
+    parser.add_argument('--ndata', type=int, default=np.inf,
                         help='Number of training datapoints (programs)')
     parser.add_argument('--split_layers', action='store_true',
                         help='Load individual layers of base models.')
@@ -107,49 +110,40 @@ def parse_args():
     else:
         args.max_rasp_len = MAX_RASP_LENGTH
         args.max_weights_len = MAX_WEIGHTS_LENGTH
+
     return args
 
 
-def load_data(args, rng: np.random.Generator, include_test: bool = False,
-) -> tuple[dict, dict, dict]:
-    data = data_utils.load_dataset_for_model_input(
-        loadfile=FULL_DATA_FILE,
-        ndata=args.ndata,
-    )
-    data['program_id'] = np.arange(len(data['tokens']))
+def load_data(args, rng: np.random.Generator) -> tuple[dict, dict, dict]:
+    with h5py.File(FULL_DATA_FILE, "r") as f:
+        for_stats = {k: v[:5000] for k, v in f["train"].items()}
 
-    test_datasets = {}
-    if include_test:
-        raise NotImplementedError('TODO: load test datasets separately.')
-
-    with jax.default_device(jax.devices("cpu")[0]):
-        train_data, val_data, stats = _process_data(data, args.symlog, args.d_model)
-        train_data = {k: np.asarray(v) for k, v in train_data.items()}
-        val_data = {k: np.asarray(v) for k, v in val_data.items()}
-    logger.info(f"Weight mean and std before normalization: {stats}")
-    return train_data, val_data, test_datasets
-
-
-@functools.partial(jax.jit, static_argnames=("symlog", "d_model"), donate_argnames=('data',))
-def _process_data(data: dict, symlog: bool, d_model: int) -> dict:
-    # TODO: shuffle data?
-    # TODO: make processing less memory intensive
-    train_data, val_data = data_utils.split_dict_data(
-        data, val_ratio=VAL_DATA_RATIO)
+    # TODO: shuffle data? would need to implement in dataloading.py
+    if args.symlog:
+        for_stats['weights'] = dataloading.symlog(for_stats['weights'])
+    w_mean, w_std = (for_stats['weights'].mean(dtype=np.float64), 
+                     for_stats['weights'].std(dtype=np.float64))
+    logger.info("Weight mean and std before normalization: "
+                f"{w_mean}, {w_std}")
     
-    if symlog:
-        train_data['weights'] = data_utils.symlog(train_data['weights'])
-        val_data['weights'] = data_utils.symlog(val_data['weights'])
+    @jax.jit
+    def process_batch(data):
+        data['program_id'] = np.arange(len(data['tokens']))
+        if args.symlog:
+            data['weights'] = dataloading.symlog(data['weights'])
+        data['weights'] = (data['weights'] - w_mean) / w_std
+        data['weights'] = einops.rearrange(
+            data['weights'], 'b (s d) -> b s d', d=args.d_model)
+        return data
+    
+    return (dataloading.DataLoader(
+        loadfile=FULL_DATA_FILE,
+        group=group,
+        batch_size=args.bs,
+        process_fn=process_batch,
+        max_datapoints=args.ndata,
+    ) for group in ["train", "val", "test"])
 
-#    # normalize weights
-    w_std = train_data["weights"].std(dtype=np.float64)
-    w_mean = train_data["weights"].mean(dtype=np.float64)
-    train_data['weights'] = (train_data['weights'] - w_mean) / w_std
-    val_data['weights'] = (val_data['weights'] - w_mean) / w_std
-    # reshape for model input
-    train_data['weights'] = einops.rearrange(train_data['weights'], 'b (s d) -> b s d', d=d_model)
-    val_data['weights'] = einops.rearrange(val_data['weights'], 'b (s d) -> b s d', d=d_model)
-    return train_data, val_data, (w_mean, w_std)
 
 
 def _get_model(args):
@@ -177,7 +171,7 @@ def _get_model(args):
     return Transformer(config=config)
 
 
-def init(rng, args, train_data) -> tuple[Transformer, Updater, dict, "Run"]:
+def init(rng, args, train_loader) -> tuple[Transformer, Updater, dict, "Run"]:
     """Initialize the model and set up the optimizer."""
     if args.restore_checkpoint_from is None:
         model = _get_model(args)
@@ -206,8 +200,7 @@ def init(rng, args, train_data) -> tuple[Transformer, Updater, dict, "Run"]:
             opt,
         )
     
-    num_steps_per_epoch = len(train_data['tokens']) // args.bs
-    num_steps = min(num_steps_per_epoch * args.max_epochs, args.max_steps)
+    num_steps = min(len(train_loader) * args.max_epochs, args.max_steps)
 
     schedule = schedules.constant_with_warmup_and_cooldown(
         args.lr,
@@ -223,8 +216,8 @@ def init(rng, args, train_data) -> tuple[Transformer, Updater, dict, "Run"]:
     # init
     subrng, rng = jax.random.split(rng)
     dummy_batch = {
-        "weights": np.ones((1, *train_data['weights'].shape[1:])),
-        "tokens": np.ones((1, *train_data['tokens'].shape[1:])),
+        "weights": np.ones((1, *train_loader.shape['weights'][1:])),
+        "tokens": np.ones((1, *train_loader.shape['tokens'][1:])),
     }
     state = updater.init_train_state(subrng, dummy_batch, 
                                 init_params=restored_params)
@@ -242,7 +235,7 @@ def init(rng, args, train_data) -> tuple[Transformer, Updater, dict, "Run"]:
             "batchsize": args.bs,
             "max_epochs": args.max_epochs,
             "model_config": asdict(model),
-            "num_datapoints": len(train_data),
+            "num_datapoints": train_loader.shape['weights'][0],
             "adam/b1": args.adam_b1,
             "adam/b2": args.adam_b2,
             "adam/eps": args.adam_eps,
@@ -255,7 +248,7 @@ def init(rng, args, train_data) -> tuple[Transformer, Updater, dict, "Run"]:
     return model, updater, state, run
 
 
-def log_metadata(args, train_data, val_data, test_datasets, model, 
+def log_metadata(args, train_loader, val_loader, model, 
                  state, checkpoint_savename) -> None:
     logger.info("Args:\n%s\n", pprint.pformat(vars(args)))
     logger.info("\n")
@@ -265,33 +258,19 @@ def log_metadata(args, train_data, val_data, test_datasets, model,
 
     data_logger.info("Args:\n%s\n", pprint.pformat(vars(args)))
 
-    MAX_INDEX = 10_000
-    sample_weights = train_data['weights'][:MAX_INDEX]
-    assert isinstance(train_data['weights'], np.ndarray)
-    assert isinstance(train_data['tokens'], np.ndarray)
+    train_shape = train_loader.shape
+    val_shape = val_loader.shape
+
     logger.info(f"Tags: {args.tags}")
-    logger.info("Number of training examples: "
-                f"{len(train_data['tokens']):,}.")
-    logger.info("Number of validation examples: "
-                f"{len(val_data['tokens']):,}.")
-
-    for name, test_data in test_datasets.items():
-        logger.info(f"Number of test examples in {name}: "
-                    f"{len(test_data['tokens']):,}.")
-
+    logger.info("Total number of training examples: "
+                f"{train_shape['tokens'][0]:,}.")
+    logger.info("Total number of validation examples: "
+                f"{val_shape['tokens'][0]:,}.")
+    logger.info(f"Max number of datapoints to load: {args.ndata:,}.")
     logger.info(f"Number of parameters in meta-model: "
                 f"{count_params(state.params) / 1e6} Million")
-    logger.info(f"Data shapes: weights: {train_data['weights'].shape}, "
-                f"tokens: {train_data['tokens'].shape}")
-    logger.info(f"Train data (weights) mean: {sample_weights.mean(dtype=np.float64)}, "
-                f"std: {sample_weights.std(dtype=np.float64)}")
-
-    for test_data in test_datasets.values():
-        logger.info(f"Test data (weights) mean: {test_data['weights'][:MAX_INDEX].mean(dtype=np.float64)}, "
-                    f"std: {test_data['weights'][:MAX_INDEX].std()}")
-
-    logger.info(f"Percent of weights zero: "
-                f"{round(100 * (sample_weights == 0).sum() / sample_weights.size, 2)}%")
+    logger.info(f"Data shapes: weights: {train_shape['weights']}, "
+                f"tokens: {train_shape['tokens']}")
     logger.info(f"Expected sequence length: {model.config.max_len}.")
     if args.save_checkpoint:
         logger.info(f"When training is completed, save final checkpoint to {checkpoint_savedir}/{checkpoint_savename}.")
@@ -300,10 +279,10 @@ def log_metadata(args, train_data, val_data, test_datasets, model,
 
 
 def log_rasp_snippet(
-        tokens: ArrayLike, 
-        preds: ArrayLike, 
-        start: int = 0,
-        end: int = 25,
+    tokens: ArrayLike, 
+    preds: ArrayLike, 
+    start: int = 0,
+    end: int = 25,
 ) -> None:
     """Args:
         - tokens: 1D array of ground-truth tokens
@@ -326,13 +305,13 @@ def log_rasp_snippet(
 
 def main():
     args = parse_args()
-    rng = jax.random.PRNGKey(args.seed)
+    rng = jax.random.key(args.seed)
     np_rng = np.random.default_rng()
 
-    train_data, val_data, test_datasets = load_data(args, np_rng)
+    train_loader, val_loader, test_loader = load_data(args, np_rng)
 
     subrng, rng = jax.random.split(rng)
-    model, updater, state, run = init(subrng, args, train_data)
+    model, updater, state, run = init(subrng, args, train_loader)
     metrics_logger = Logger()
 
     if args.use_wandb:
@@ -340,23 +319,20 @@ def main():
     else:
         checkpoint_savename = f"run_{int(time())}"
 
-    log_metadata(args, train_data, val_data, test_datasets, model,
+    log_metadata(args, train_loader, val_loader, model,
                     state, checkpoint_savename)
 
 
-    def train(state):
+    def train_one_epoch(state):
         """Train for one epoch. Return updated state."""
-        # TODO: shuffle train data
-#        assert not np.any(np.isnan(train_data['weights']))
-#        assert not np.any(np.isnan(train_data['tokens']))
-#        assert not np.isnan(jax.flatten_util.ravel_pytree(state.params)[0]).any()
         stop_training = False
-        for batch in tqdm(
-                data_iterator(train_data, args.bs, stacked_tree=True, skip_last=True),
-                disable=disable_tqdm,
-                desc="Training",
-                total=len(train_data['tokens']) // args.bs,
-        ):
+        past_steps = state.step
+        for i, batch in enumerate(tqdm(
+            train_loader,
+            disable=disable_tqdm,
+            desc="Training",
+        )):
+            step = past_steps + i
             chex.assert_shape(batch["weights"], 
                               (args.bs, None, None))
             chex.assert_shape(batch["tokens"], (args.bs, None)) 
@@ -364,36 +340,35 @@ def main():
             state, train_metrics = updater.update(state, batch)
             metrics_logger.write(state, train_metrics, name="train")
 
+            if step in [1, 2, 4, 8, 16, 32, 64, 128]:
+                # log more frequently early on
+                metrics_logger.flush_mean(state, name="train",
+                        verbose=disable_tqdm, extra_metrics={"epoch": epoch})
+
             if time() - start > args.max_runtime * 60:
                 logger.info("Maximum runtime reached. Stopping training.")
                 stop_training = True
                 break
 
-            if state.step > args.max_steps:
+            if step > args.max_steps:
                 logger.info("Maximum number of steps reached. Stopping "
                             "training.")
                 stop_training = True
                 break
             
-            if state.step in [1, 2, 4, 8, 16, 32, 64, 128]:
-                # log more frequently early on
-                metrics_logger.flush_mean(state, name="train",
-                        verbose=disable_tqdm, extra_metrics={"epoch": epoch})
-
-        if state.step > 128:
+        if step > 128:
             # log once per epoch
             metrics_logger.flush_mean(state, name="train",
                     verbose=disable_tqdm, extra_metrics={"epoch": epoch})
+
         return state, stop_training
 
 
-    def compute_metrics(state, data, name="test"):
+    def compute_metrics(state, dataloader, name="test"):
         out = dict(mask=[], correct_preds=[], program_id=[])
         data_logger.info(datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " - "
                          f"Logging step {state.step}. Data: {name}.")
-        for i, batch in enumerate(
-                    data_iterator(data, args.bs, stacked_tree=True)):
-
+        for i, batch in enumerate(dataloader):
             chex.assert_shape(batch["tokens"], (None, None)) 
             chex.assert_shape(batch["weights"],
                               (None, None, None))
@@ -417,7 +392,7 @@ def main():
                         )
                     except IndexError:
                         break
-
+            
         data_logger.info(datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " - "
                          f"Done logging snippets.")
         data_logger.info("\n=======================================\n")
@@ -455,19 +430,16 @@ def main():
 
     # Training loop
     start = time()
+    logger.info("Start training.")
     disable_tqdm = not interactive or args.disable_tqdm
     for epoch in range(args.max_epochs):
         if epoch % args.val_every == 0:
-            state = compute_metrics(state, val_data, name="val")
-            for name, test_data in test_datasets.items():
-                state = compute_metrics(state, test_data, name=name)
+            state = compute_metrics(state, val_loader, name="val")
 
-        state, stop_training = train(state)
+        state, stop_training = train_one_epoch(state)
 
         if stop_training:
-            state = compute_metrics(state, val_data, name="val")
-            for name, test_data in test_datasets.items():
-                state = compute_metrics(state, test_data, name=name)
+            state = compute_metrics(state, val_loader, name="val")
             break
     
     logger.info("=======================================")
@@ -488,7 +460,6 @@ def main():
                             "kernel", "bias", "posemb", "dtype"])}
         info = {
             'model_config': model_config,
-            'ndata': args.ndata,
         }
         with open(checkpoint_savedir / "info.json", "w") as f:
             json.dump(info, f, indent=4)

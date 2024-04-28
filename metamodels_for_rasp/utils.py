@@ -50,11 +50,11 @@ def create_loss_fn(model_forward: callable):
 
 
 def data_iterator(
-        data,
-        batchsize=1024, 
-        skip_last=False,
-        stacked_tree=False,
-    ) -> Iterator:
+    data,
+    batchsize=1024, 
+    skip_last=False,
+    stacked_tree=False,
+) -> Iterator:
     """Iterate over the data in batches. Single epoch."""
     n = tree_leaves_len(data) if stacked_tree else len(data)
     for i in range(0, n, batchsize):
