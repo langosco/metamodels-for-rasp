@@ -20,44 +20,14 @@ from metamodels_for_rasp.logger_config import setup_logger, setup_data_logger
 from metamodels_for_rasp.model import Transformer, TransformerConfig
 from metamodels_for_rasp.utils import count_params, data_iterator, color_sequence, create_loss_fn, compute_fracs_correct_by_program
 
-from rasp_tokenizer import paths
-from rasp_tokenizer.data_utils import load_and_process_data
-from rasp_tokenizer import MAX_RASP_LENGTH, MAX_WEIGHTS_LENGTH
-from rasp_tokenizer import tokenizer, vocab
+from decompile_tracr.dataset import config as dataset_config
+from decompile_tracr.dataset import data_utils
+from decompile_tracr.tokenizing import vocab
 
 
 logger = setup_logger(__name__)
 data_logger = setup_data_logger(logfile="test.log")
 checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-
-
-TEST_DATA_NAMES = [
-#    "train",
-#    "test_5",
-    "test",
-    "lib",
-]
-
-
-def load_data(d_model: int, test_data_names=TEST_DATA_NAMES):
-    TRAIN_DATA_STD = 2.656
-
-    test_datasets = {
-        name: load_and_process_data(
-            rng=None,
-            ndata=None,
-            shuffle=False,
-            name=name,
-            d_model=d_model,
-            max_rasp_len=MAX_RASP_LENGTH,
-            max_weights_len=MAX_WEIGHTS_LENGTH,
-        ) for name in test_data_names
-    }
-
-    for v in test_datasets.values():
-        v['weights'] = v['weights'] / TRAIN_DATA_STD
-
-    return test_datasets
 
 
 def get_model(checkpoint_path: str):
@@ -275,7 +245,7 @@ def main():
         )
 
         if name == 'lib':
-            savepath = paths.data_dir / "metrics" / "metrics-lib.pkl"
+            savepath = dataset_config.data_dir / "metrics" / "metrics-lib.pkl"
             os.makedirs(savepath.parent, exist_ok=True)
             logger.info(f"Saving metrics for lib dataset to {savepath}.")
             with open(savepath, 'wb') as f:
@@ -294,9 +264,9 @@ def main():
             logger.info(f"{k}: {v}")
 
         if not args.autoregressive:
-            savepath = paths.data_dir / 'metrics' / f"{name}-metrics-by-category.json"
+            savepath = dataset_config.data_dir / 'metrics' / f"{name}-metrics-by-category.json"
         else:
-            savepath = paths.data_dir / 'metrics' / f"{name}-metrics-by-category-autoregressive.json"
+            savepath = dataset_config.data_dir / 'metrics' / f"{name}-metrics-by-category-autoregressive.json"
         os.makedirs(savepath.parent, exist_ok=True)
         logger.info(f"Saving metrics to {savepath}.")
         save_to_json(accs_by_category, savepath)

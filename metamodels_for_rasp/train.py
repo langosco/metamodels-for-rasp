@@ -78,9 +78,11 @@ class Updater:
         }
         if "metrics" in aux:
             metrics.update({f"train/{k}": v for k, v in aux["metrics"].items()})
-        metrics.update({
-            f"opt/{k}": v for k, v in state.opt_state.hyperparams.items()
-            })
+        
+        if hasattr(state.opt_state, "hyperparams"):
+            metrics.update({
+                f"opt/{k}": v for k, v in state.opt_state.hyperparams.items()
+                })
         state.step += 1
         return state, metrics
 

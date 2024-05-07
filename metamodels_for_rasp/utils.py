@@ -1,73 +1,9 @@
+from typing import Sequence
+
+import numpy as np
 import jax
 import jax.numpy as jnp
-import numpy as np
-from typing import Sequence, Iterator
-from jax.typing import ArrayLike
-import optax
 import chex
-
-from decompile_tracr.tokenizing import vocab
-
-
-def accuracy(logits, targets, mask) -> tuple[float, jnp.ndarray]:
-    hits = (logits.argmax(axis=-1) == targets) * mask
-    return hits.sum() / mask.sum(), hits
-
-
-def get_mask(tokens):
-    """Get mask for padding tokens."""
-    return jnp.where(tokens == vocab.pad_id, 0, 1)
-
-
-def create_loss_fn(model_forward: callable):
-    def loss_fn(
-            params: dict,
-            rng: ArrayLike,
-            batch: dict,
-            is_training: bool = True,
-    ) -> tuple[float, dict]:
-        """Compute loss for a batch."""
-        tokens = batch['tokens']
-
-        outputs = model_forward(
-            {"params": params},
-            batch,
-            is_training=is_training,
-            rngs={"dropout": rng},
-        )
-
-        loss_mask = get_mask(tokens)
-        logits = outputs[:, -tokens.shape[1]-1:-1, :]
-        loss = optax.softmax_cross_entropy_with_integer_labels(logits, tokens)
-        loss = jnp.sum(loss * loss_mask) / jnp.sum(loss_mask)
-        acc, correct_preds = accuracy(logits, tokens, loss_mask)
-        metrics = {"accuracy": acc}
-        aux = dict(outputs=outputs, logits=logits, metrics=metrics, 
-                   correct_preds=correct_preds, mask=loss_mask,
-                   preds=logits.argmax(axis=-1), program_id=batch['program_id'])
-        return loss, aux
-    return loss_fn
-
-
-def data_iterator(
-    data,
-    batchsize=1024, 
-    skip_last=False,
-    stacked_tree=False,
-) -> Iterator:
-    """Iterate over the data in batches. Single epoch."""
-    n = tree_leaves_len(data) if stacked_tree else len(data)
-    for i in range(0, n, batchsize):
-        if i + batchsize > n:
-            if skip_last:
-                break
-            else:
-                batchsize = n - i
-
-        if stacked_tree:
-            yield jax.tree_map(lambda x: x[i:i + batchsize], data)
-        else:
-            yield data[i:i + batchsize]
 
 
 def count_params(params: dict) -> int:
@@ -126,7 +62,6 @@ def get_mean_and_std_of_tree(tree):
 def split_data(data: Sequence, val_data_ratio: float = 0.1):
     split_index = int(len(data)*(1-val_data_ratio))
     return data[:split_index], data[split_index:]
-
 
 
 color_codes = {
