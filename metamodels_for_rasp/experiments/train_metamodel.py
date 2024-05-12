@@ -1,3 +1,4 @@
+import os
 from time import time
 from datetime import datetime
 import json
@@ -19,6 +20,15 @@ from decompile_tracr.dataset import config as dataset_config
 
 #jax.config.update("jax_disable_jit", True)
 #jax.config.update("jax_debug_nans", True)
+
+os.environ['XLA_FLAGS'] = (
+#    '--xla_gpu_enable_triton_softmax_fusion=true '  # results in 'Command terminated by signal 11'
+    '--xla_gpu_triton_gemm_any=True '
+    '--xla_gpu_enable_async_collectives=true '
+    '--xla_gpu_enable_latency_hiding_scheduler=true '
+    '--xla_gpu_enable_highest_priority_async_stream=true '
+)
+
 
 logger = setup_logger(__name__)
 data_logger = setup_data_logger(logfile="train.log")

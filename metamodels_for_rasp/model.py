@@ -17,7 +17,7 @@ class TransformerConfig:
 
     vocab_size: int
     output_vocab_size: int
-    dtype: Any = jnp.float32
+    dtype: Any = jnp.bfloat16
     emb_dim: int = 512
     num_heads: int = 8
     num_layers: int = 6
