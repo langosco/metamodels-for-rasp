@@ -25,12 +25,10 @@ from metamodels_for_rasp.utils import color_sequence, count_params
 from decompile_tracr.tokenizing import vocab
 from decompile_tracr.tokenizing import tokenizer
 from decompile_tracr.dataset import dataloading
-from decompile_tracr.dataset.config import DatasetConfig
+from decompile_tracr.dataset.config import load_config
 
 
 logger = setup_logger(__name__)
-DEFAULT_DATA_CONFIG = DatasetConfig()
-DEFAULT_DATA_PATH = DEFAULT_DATA_CONFIG.paths.dataset
 
 
 def parse_args():
@@ -73,11 +71,8 @@ def parse_args():
                         help='Number of training datapoints (programs)')
     parser.add_argument('--split_layers', action='store_true',
                         help='Load individual layers of base models.')
-    parser.add_argument('--max_rasp_len', type=int, default=None,
-                        help='Maximum length of RASP tokens per datapoint.')
-    parser.add_argument('--max_weights_len', type=int, default=None,
-                        help='Maximum number of parameters per datapoint.')
     parser.add_argument('--symlog', action='store_true')
+    parser.add_argument('--data_config', type=str, default=None)
 
     # wandb
     parser.add_argument('--use_wandb', action='store_true')
@@ -94,18 +89,19 @@ def parse_args():
     if args.wandb_run_name is not None:
         args.wandb_run_name += str(int(time.time()))
     
-    if args.max_weights_len is None:
-        args.max_weights_len = DEFAULT_DATA_CONFIG.max_weights_length
-    
-    if args.max_rasp_len is None:
-        args.max_rasp_len = DEFAULT_DATA_CONFIG.max_rasp_length
-
+    args.data_config = load_config(args.data_config)
     return args
 
 
 def get_dataloaders(args, rng: np.random.Generator) -> tuple[dict, dict, dict]:
-    with h5py.File(DEFAULT_DATA_PATH, "r") as f:
+    config = args.data_config
+    with h5py.File(config.paths.dataset, "r") as f:
         for_stats = {k: v[:5000] for k, v in f["train"].items()}
+
+    assert for_stats['weights'].shape == (5000, config.max_weights_length), (
+        f"Expected shape (5000, {config.max_weights_length}) based on config, "
+        f"instead got {for_stats['weights'].shape}."
+    )
 
     # TODO: shuffle data? would need to implement in dataloading.py
     if args.symlog:
@@ -126,7 +122,7 @@ def get_dataloaders(args, rng: np.random.Generator) -> tuple[dict, dict, dict]:
         return data
     
     return (dataloading.DataLoader(
-        loadfile=DEFAULT_DATA_PATH,
+        loadfile=config.paths.dataset,
         group=group,
         batch_size=args.bs,
         process_fn=process_batch,
@@ -213,15 +209,15 @@ def init(rng, args, dataloader) -> tuple[Transformer, Updater, dict, "Run"]:
 
 
 def _get_model(args):
-    weight_len = args.max_weights_len / args.d_model
+    weight_len = args.data_config.max_weights_length / args.d_model
 
     assert weight_len.is_integer()
     weight_len = int(weight_len)
-    seq_len = args.max_rasp_len + weight_len
+    seq_len = args.data_config.max_rasp_length + weight_len
 
     config = TransformerConfig(
         weight_len=weight_len,
-        rasp_tok_len=args.max_rasp_len,
+        rasp_tok_len=args.data_config.max_rasp_length,
         vocab_size=vocab.size,
         output_vocab_size=vocab.size,
         emb_dim=args.d_model,
