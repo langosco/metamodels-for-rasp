@@ -25,11 +25,12 @@ from metamodels_for_rasp.utils import color_sequence, count_params
 from decompile_tracr.tokenizing import vocab
 from decompile_tracr.tokenizing import tokenizer
 from decompile_tracr.dataset import dataloading
-from decompile_tracr.dataset import config
+from decompile_tracr.dataset.config import DatasetConfig
 
 
 logger = setup_logger(__name__)
-FULL_DATA_FILE = config.data_dir / "full.h5"
+DEFAULT_DATA_CONFIG = DatasetConfig()
+DEFAULT_DATA_PATH = DEFAULT_DATA_CONFIG.paths.dataset
 
 
 def parse_args():
@@ -94,16 +95,16 @@ def parse_args():
         args.wandb_run_name += str(int(time.time()))
     
     if args.max_weights_len is None:
-        args.max_weights_len = config.MAX_WEIGHTS_LENGTH
+        args.max_weights_len = DEFAULT_DATA_CONFIG.max_weights_length
     
     if args.max_rasp_len is None:
-        args.max_rasp_len = config.MAX_RASP_LENGTH
+        args.max_rasp_len = DEFAULT_DATA_CONFIG.max_rasp_length
 
     return args
 
 
 def get_dataloaders(args, rng: np.random.Generator) -> tuple[dict, dict, dict]:
-    with h5py.File(FULL_DATA_FILE, "r") as f:
+    with h5py.File(DEFAULT_DATA_PATH, "r") as f:
         for_stats = {k: v[:5000] for k, v in f["train"].items()}
 
     # TODO: shuffle data? would need to implement in dataloading.py
@@ -125,7 +126,7 @@ def get_dataloaders(args, rng: np.random.Generator) -> tuple[dict, dict, dict]:
         return data
     
     return (dataloading.DataLoader(
-        loadfile=FULL_DATA_FILE,
+        loadfile=DEFAULT_DATA_PATH,
         group=group,
         batch_size=args.bs,
         process_fn=process_batch,

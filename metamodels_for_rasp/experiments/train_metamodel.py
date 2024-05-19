@@ -15,8 +15,6 @@ from metamodels_for_rasp.logger_config import setup_logger, setup_data_logger
 from metamodels_for_rasp.utils import compute_fracs_correct_by_program
 from metamodels_for_rasp.experiments import common
 
-from decompile_tracr.dataset import config as dataset_config
-
 
 #jax.config.update("jax_disable_jit", True)
 #jax.config.update("jax_debug_nans", True)
@@ -34,8 +32,6 @@ logger = setup_logger(__name__)
 data_logger = setup_data_logger(logfile="train.log")
 START_TIME = time()
 VAL_DATA_RATIO = 0.1
-MAX_RASP_LENGTH = dataset_config.MAX_RASP_LENGTH
-MAX_WEIGHTS_LENGTH = dataset_config.MAX_WEIGHTS_LENGTH
 
 
 def main():
