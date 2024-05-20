@@ -73,6 +73,8 @@ def parse_args():
                         help='Load individual layers of base models.')
     parser.add_argument('--symlog', action='store_true')
     parser.add_argument('--data_config', type=str, default=None)
+    parser.add_argument('--dummy_data_for_baseline', action='store_true',
+                        help='Train using random weights')
 
     # wandb
     parser.add_argument('--use_wandb', action='store_true')
@@ -119,6 +121,9 @@ def get_dataloaders(args, rng: np.random.Generator) -> tuple[dict, dict, dict]:
         data['weights'] = (data['weights'] - w_mean) / w_std
         data['weights'] = einops.rearrange(
             data['weights'], 'b (s d) -> b s d', d=args.d_model)
+        if args.dummy_data_for_baseline:
+            data['weights'] = jax.random.normal(
+                jax.random.key(0), shape=data['weights'].shape)
         return data
     
     return (dataloading.DataLoader(

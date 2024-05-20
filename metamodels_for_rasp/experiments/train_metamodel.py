@@ -141,20 +141,17 @@ def main():
         )
         reconstruction_fracs = np.array(reconstruction_fracs)
 
-        program_acc = np.mean(reconstruction_fracs == 1.0)
-        program_acc_50 = np.mean(reconstruction_fracs > 0.5)
-
         metrics_logger.flush_mean(
             state, 
             name=name, 
             verbose=False, 
             extra_metrics={
                 "epoch": epoch,
-                f"{name}/program_accuracy": program_acc,
-                f"{name}/program_accuracy_50": program_acc_50,
+                f"{name}/program_accuracy_75": np.mean(reconstruction_fracs > 0.8),
                 f"{name}/program_accuracy_90": np.mean(reconstruction_fracs > 0.9),
                 f"{name}/program_accuracy_95": np.mean(reconstruction_fracs > 0.95),
                 f"{name}/program_accuracy_98": np.mean(reconstruction_fracs > 0.98),
+                f"{name}/program_accuracy": np.mean(reconstruction_fracs == 1.0),
                 f"{name}/program_frac_correct": np.mean(reconstruction_fracs),
                 f"{name}/program_frac_correct_std": np.std(reconstruction_fracs),
             }
