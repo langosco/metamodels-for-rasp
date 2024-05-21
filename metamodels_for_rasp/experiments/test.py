@@ -45,7 +45,13 @@ common.log_metadata(args, model, dict(test=test_loader), state, None)
 
 
 def compute_metrics(state, dataloader, name="test"):
-    out = dict(mask=[], correct_preds=[], program_id=[])
+    out = dict(
+        mask=[], 
+        correct_preds=[], 
+        program_id=[], 
+        program_length=[],
+    )
+
     data_logger.info(datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " - "
                         f"Logging step {state.step}. Data: {name}.")
     
@@ -60,8 +66,10 @@ def compute_metrics(state, dataloader, name="test"):
         metrics_list.append(metrics)
 
         for k in out.keys():
-            out[k].append(aux[k])
-        out["program_length"] = batch["program_length"]
+            if k in aux.keys():
+                out[k].append(aux[k])
+
+        out["program_length"].append(batch["n_sops"])
     
         if i < 10:
             data_logger.info(f"Step {state.step}, {name} batch {i}:")
@@ -111,11 +119,11 @@ def compute_metrics(state, dataloader, name="test"):
         length_l_outputs = {
             k: v[length_l_mask] for k, v in out.items()
         }
-        length_l_rec_fracs = compute_fracs_correct_by_program(
+        length_l_rec_fracs = np.array(compute_fracs_correct_by_program(
             program_ids=length_l_outputs['program_id'],
             correct_preds=length_l_outputs['correct_preds'],
             mask=length_l_outputs['mask'],
-        )
+        ))
         metrics_by_program_length[l] = {
             f"{name}/program_accuracy_75": np.mean(length_l_rec_fracs > 0.8),
             f"{name}/program_accuracy_90": np.mean(length_l_rec_fracs > 0.9),
@@ -153,7 +161,7 @@ dataloading.DataLoader(
     loadfile=lib_dataset_path,
     group="lib",
     batch_size=4,
-    process_fn=test_loader.process_batch,
+    process_fn=test_loader.process_fn,
     max_datapoints=100,
 )
 
