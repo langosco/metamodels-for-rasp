@@ -16,6 +16,8 @@ from metamodels_for_rasp.logger_config import setup_logger, setup_data_logger
 from metamodels_for_rasp.utils import compute_fracs_correct_by_program
 from metamodels_for_rasp.experiments import common
 
+from decompile_tracr.dataset import dataloading
+
 
 #jax.config.update("jax_disable_jit", True)
 #jax.config.update("jax_debug_nans", True)
@@ -88,10 +90,24 @@ def compute_metrics(state, dataloader, name="test"):
     )
     reconstruction_fracs = np.array(reconstruction_fracs)
 
+    metrics.update({
+        f"{name}/program_accuracy_75": np.mean(reconstruction_fracs > 0.8),
+        f"{name}/program_accuracy_90": np.mean(reconstruction_fracs > 0.9),
+        f"{name}/program_accuracy_95": np.mean(reconstruction_fracs > 0.95),
+        f"{name}/program_accuracy_98": np.mean(reconstruction_fracs > 0.98),
+        f"{name}/program_accuracy": np.mean(reconstruction_fracs == 1.0),
+        f"{name}/program_frac_correct": np.mean(reconstruction_fracs),
+        f"{name}/program_frac_correct_std": np.std(reconstruction_fracs),
+    })
+
+
     # split by program length
     metrics_by_program_length = {}
     for l in range(1, 11):
         length_l_mask = out["program_length"] == l
+        if not length_l_mask.any():
+            continue
+
         length_l_outputs = {
             k: v[length_l_mask] for k, v in out.items()
         }
@@ -108,22 +124,10 @@ def compute_metrics(state, dataloader, name="test"):
             f"{name}/program_accuracy": np.mean(length_l_rec_fracs == 1.0),
             f"{name}/program_frac_correct": np.mean(length_l_rec_fracs),
             f"{name}/program_frac_correct_std": np.std(length_l_rec_fracs),
+            f"{name}/accuracy": (
+                out['correct_preds'].sum() / out['mask'].sum())
         }
 
-        metrics_by_program_length[f"{name}/accuracy"] = (
-            out['correct_preds'].sum() / out['mask'].sum())
-
-
-
-    metrics.update({
-        f"{name}/program_accuracy_75": np.mean(reconstruction_fracs > 0.8),
-        f"{name}/program_accuracy_90": np.mean(reconstruction_fracs > 0.9),
-        f"{name}/program_accuracy_95": np.mean(reconstruction_fracs > 0.95),
-        f"{name}/program_accuracy_98": np.mean(reconstruction_fracs > 0.98),
-        f"{name}/program_accuracy": np.mean(reconstruction_fracs == 1.0),
-        f"{name}/program_frac_correct": np.mean(reconstruction_fracs),
-        f"{name}/program_frac_correct_std": np.std(reconstruction_fracs),
-    })
 
     return metrics
 
@@ -139,4 +143,27 @@ print()
 logger.info("Test metrics:")
 logger.info("==============")
 for k, v in metrics.items():
+    logger.info(f"{k}: {v:.4f}")
+
+
+
+# lib
+lib_dataset_path = ...
+dataloading.DataLoader(
+    loadfile=lib_dataset_path,
+    group="lib",
+    batch_size=4,
+    process_fn=test_loader.process_batch,
+    max_datapoints=100,
+)
+
+lib_metrics = compute_metrics(state, test_loader, name="test")
+
+print()
+print()
+print()
+
+logger.info("Metrics on handcrafted examples:")
+logger.info("==============")
+for k, v in lib_metrics.items():
     logger.info(f"{k}: {v:.4f}")
