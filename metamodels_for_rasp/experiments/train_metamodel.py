@@ -163,18 +163,22 @@ def main():
     # Training loop
     start = time()
     logger.info("Start training.")
-    for epoch in range(args.max_epochs):
-        if epoch % args.val_every == 0:
-            logger.info(f"Validating pre epoch {epoch}.")
-            state = compute_metrics(state, val_loader, name="val")
 
-        state, stop_training = train_one_epoch(state)
+    try:
+        for epoch in range(args.max_epochs):
+            if epoch % args.val_every == 0:
+                logger.info(f"Validating pre epoch {epoch}.")
+                state = compute_metrics(state, val_loader, name="val")
 
-        if stop_training:
-            logger.info(f"Final validation before stopping training "
-                        f"at epoch {epoch}.")
-            state = compute_metrics(state, val_loader, name="val")
-            break
+            state, stop_training = train_one_epoch(state)
+
+            if stop_training:
+                logger.info(f"Final validation before stopping training "
+                            f"at epoch {epoch}.")
+                state = compute_metrics(state, val_loader, name="val")
+                break
+    except KeyboardInterrupt:
+        logger.info("Training interrupted by user.")
     
     logger.info("=======================================")
     logger.info("Completed.")
