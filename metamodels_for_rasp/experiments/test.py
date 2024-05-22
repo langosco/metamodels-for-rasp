@@ -170,7 +170,7 @@ for length, m in metrics_by_length.items():
 
 # lib
 lib_dataset_path = args.data_config.paths.dataset
-dataloading.DataLoader(
+lib_loader = dataloading.DataLoader(
     loadfile=lib_dataset_path,
     group="lib",
     batch_size=4,
@@ -178,7 +178,7 @@ dataloading.DataLoader(
     max_datapoints=100,
 )
 
-lib_metrics, lib_metrics_by_length = compute_metrics(state, test_loader, name="lib")
+lib_metrics, lib_metrics_by_length = compute_metrics(state, lib_loader, name="lib")
 
 print()
 print()
