@@ -153,7 +153,7 @@ def init(rng, args, dataloader) -> tuple[Transformer, Updater, dict, "Run"]:
         for k, v in model_config.items():
             try:
                 model_config[k] = v.item()
-            except TypeError:
+            except AttributeError:
                 pass
         model = Transformer(config=TransformerConfig(**model_config))
         logger.info(f"Restored params from {args.restore_checkpoint_from}."
