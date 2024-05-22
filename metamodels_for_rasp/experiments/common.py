@@ -146,6 +146,11 @@ def init(rng, args, dataloader) -> tuple[Transformer, Updater, dict, "Run"]:
         restored_params, model_config = checkpointer.restore(
             args.checkpoint_dir / args.restore_checkpoint_from)
         model_config = {k: v for k, v in model_config.items() if v is not None}
+        for k, v in model_config.items():
+            try:
+                model_config[k] = v.item()
+            except TypeError:
+                pass
         model = Transformer(config=TransformerConfig(**model_config))
         logger.info(f"Restored params from {args.restore_checkpoint_from}."
                     " This overrides model config args.")

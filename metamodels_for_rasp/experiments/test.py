@@ -17,6 +17,7 @@ from metamodels_for_rasp.utils import compute_fracs_correct_by_program
 from metamodels_for_rasp.experiments import common
 
 from decompile_tracr.dataset import dataloading
+from decompile_tracr.dataset.config import get_config
 
 
 #jax.config.update("jax_disable_jit", True)
@@ -156,7 +157,8 @@ for k, v in metrics.items():
 
 
 # lib
-lib_dataset_path = ...
+config = get_config(args.config)
+lib_dataset_path = config.paths.dataset
 dataloading.DataLoader(
     loadfile=lib_dataset_path,
     group="lib",
