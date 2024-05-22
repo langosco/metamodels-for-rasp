@@ -34,7 +34,8 @@ args = common.parse_args()
 rng = jax.random.key(args.seed)
 np_rng = np.random.default_rng()
 
-train_loader, _, test_loader = common.get_dataloaders(args, np_rng)
+train_loader, test_loader = common.get_dataloaders(
+    args, np_rng, groups=["train", "test"])
 
 subrng, rng = jax.random.split(rng)
 model, updater, state, _ = common.init(subrng, args, train_loader)

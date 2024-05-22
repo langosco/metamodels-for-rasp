@@ -95,7 +95,11 @@ def parse_args():
     return args
 
 
-def get_dataloaders(args, rng: np.random.Generator) -> tuple[dict, dict, dict]:
+def get_dataloaders(
+    args,
+    rng: np.random.Generator,
+    groups=["train", "val", "test"],
+) -> tuple[dict, dict, dict]:
     config = args.data_config
     with h5py.File(config.paths.dataset, "r") as f:
         for_stats = {k: v[:5000] for k, v in f["train"].items()}
@@ -132,7 +136,7 @@ def get_dataloaders(args, rng: np.random.Generator) -> tuple[dict, dict, dict]:
         batch_size=args.bs,
         process_fn=process_batch,
         max_datapoints=args.ndata,
-    ) for group in ["train", "val", "test"])
+    ) for group in groups)
 
 
 def init(rng, args, dataloader) -> tuple[Transformer, Updater, dict, "Run"]:
