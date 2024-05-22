@@ -138,12 +138,12 @@ def compute_metrics(state, dataloader, name="test"):
         }
 
 
-    return metrics
+    return metrics, metrics_by_program_length
 
 
 start = time()
 logger.info("Start testing.")
-metrics = compute_metrics(state, test_loader, name="test")
+metrics, metrics_by_length = compute_metrics(state, test_loader, name="test")
 
 print()
 print()
@@ -154,11 +154,19 @@ logger.info("==============")
 for k, v in metrics.items():
     logger.info(f"{k}: {v:.4f}")
 
+print()
+print()
+logger.info("Metrics by program length:")
+logger.info("==============")
+for length, m in metrics_by_length.items():
+    logger.info(f"Length {length}:")
+    for k, v in m.items():
+        logger.info(f"{k}: {v:.4f}")
+    print()
 
 
 # lib
-config = load_config(args.data_config)
-lib_dataset_path = config.paths.dataset
+lib_dataset_path = args.data_config.paths.dataset
 dataloading.DataLoader(
     loadfile=lib_dataset_path,
     group="lib",
@@ -167,7 +175,7 @@ dataloading.DataLoader(
     max_datapoints=100,
 )
 
-lib_metrics = compute_metrics(state, test_loader, name="test")
+lib_metrics, lib_metrics_by_length = compute_metrics(state, test_loader, name="lib")
 
 print()
 print()
