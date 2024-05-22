@@ -157,7 +157,7 @@ for k, v in metrics.items():
 
 
 # lib
-config = load_config(args.config)
+config = load_config(args.data_config)
 lib_dataset_path = config.paths.dataset
 dataloading.DataLoader(
     loadfile=lib_dataset_path,

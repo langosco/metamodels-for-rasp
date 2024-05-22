@@ -31,7 +31,6 @@ os.environ['XLA_FLAGS'] = (
 logger = setup_logger(__name__)
 data_logger = setup_data_logger(logfile="train.log")
 START_TIME = time()
-VAL_DATA_RATIO = 0.1
 
 
 def main():
@@ -177,6 +176,29 @@ def main():
                             f"at epoch {epoch}.")
                 state = compute_metrics(state, val_loader, name="val")
                 break
+
+            if epoch in [20, 30, 40, 50]:
+                try:
+                    checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+
+                    savename = checkpoint_savename + f"_epoch_{epoch}" 
+                    logger.info("Saving checkpoint...")
+                    checkpointer.save(
+                        args.checkpoint_dir / savename, (state.params, model.config))
+
+                    model_config = {k: v for k, v in vars(model.config).items() 
+                                    if not any(k.startswith(p) for p in [
+                                        "kernel", "bias", "posemb", "dtype"])}
+                    info = {
+                        'model_config': model_config,
+                    }
+                    with open(args.checkpoint_dir / "info.json", "w") as f:
+                        json.dump(info, f, indent=4)
+
+                    logger.info(f"Checkpoint saved to "
+                                f"{args.checkpoint_dir}/{savename}.")
+                except Exception as e:
+                    logger.error(f"Error saving checkpoint: {e}")
     except KeyboardInterrupt:
         logger.info("Training interrupted by user.")
     
