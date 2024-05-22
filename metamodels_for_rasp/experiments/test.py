@@ -3,6 +3,7 @@ from time import time
 from datetime import datetime
 import json
 from tqdm import tqdm
+from pathlib import Path
 
 import jax
 import chex
@@ -11,6 +12,7 @@ import orbax.checkpoint
 import optax
 
 from metamodels_for_rasp import interactive
+from metamodels_for_rasp import output_dir
 from metamodels_for_rasp.train import Logger
 from metamodels_for_rasp.logger_config import setup_logger, setup_data_logger
 from metamodels_for_rasp.utils import compute_fracs_correct_by_program
@@ -185,3 +187,32 @@ logger.info("Metrics on handcrafted examples:")
 logger.info("==============")
 for k, v in lib_metrics.items():
     logger.info(f"{k}: {v:.4f}")
+
+print()
+print()
+
+
+def to_float_recursive(d: dict):
+    for k, v in d.items():
+        try:
+            d[k] = v.item()
+        except AttributeError:
+            # assume v is dict-like
+            d[k] = to_float_recursive(v)
+    return d
+
+
+# save
+data = dict(
+    test=metrics,
+    by_length=metrics_by_length,
+    lib=lib_metrics,
+)
+data = to_float_recursive(data)
+checkpoint_name = args.restore_checkpoint_from
+savefile = Path(output_dir) / "results" / f"{checkpoint_name}.json"
+savefile.parent.mkdir(parents=True, exist_ok=True)
+
+logger.info(f"Saving results to {savefile}")
+with open(savefile, "w") as f:
+    json.dump(data, f, indent=4)
