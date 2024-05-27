@@ -6,6 +6,7 @@ from pathlib import Path
 import time
 import logging
 import pprint
+from typing import Optional
 
 import numpy as np
 import einops
@@ -22,8 +23,8 @@ from metamodels_for_rasp.train import Updater
 from metamodels_for_rasp.logger_config import setup_logger
 from metamodels_for_rasp.model import Transformer, TransformerConfig
 from metamodels_for_rasp.utils import color_sequence, count_params
-from decompile_tracr.tokenizing import vocab
-from decompile_tracr.tokenizing import tokenizer
+from decompile_tracr.tokenize import vocab
+from decompile_tracr.tokenize import tokenizer
 from decompile_tracr.dataset import dataloading
 from decompile_tracr.dataset.config import load_config
 
@@ -139,7 +140,12 @@ def get_dataloaders(
     ) for group in groups)
 
 
-def init(rng, args, dataloader) -> tuple[Transformer, Updater, dict, "Run"]:
+def init(
+    rng,
+    args,
+    dataloader,
+    config_updates: Optional[dict] = None,
+) -> tuple[Transformer, Updater, dict, "Run"]:
     """Initialize model, optimizer, loss function, and wandb run.
     """
     if args.restore_checkpoint_from is None:
@@ -155,6 +161,8 @@ def init(rng, args, dataloader) -> tuple[Transformer, Updater, dict, "Run"]:
                 model_config[k] = v.item()
             except AttributeError:
                 pass
+        if config_updates is not None:
+            model_config.update(config_updates)
         model = Transformer(config=TransformerConfig(**model_config))
         logger.info(f"Restored params from {args.restore_checkpoint_from}."
                     " This overrides model config args.")
