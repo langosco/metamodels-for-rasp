@@ -23,10 +23,10 @@ from metamodels_for_rasp.train import Updater
 from metamodels_for_rasp.logger_config import setup_logger
 from metamodels_for_rasp.model import Transformer, TransformerConfig
 from metamodels_for_rasp.utils import color_sequence, count_params
-from decompile_tracr.tokenize import vocab
-from decompile_tracr.tokenize import tokenizer
-from decompile_tracr.dataset import dataloading
-from decompile_tracr.dataset.config import load_config
+from rasp_gen.tokenize import vocab
+from rasp_gen.tokenize import tokenizer
+from rasp_gen.dataset import dataloading
+from rasp_gen.dataset.config import load_config
 
 
 logger = setup_logger(__name__)

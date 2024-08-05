@@ -18,8 +18,8 @@ from metamodels_for_rasp.logger_config import setup_logger, setup_data_logger
 from metamodels_for_rasp.utils import compute_fracs_correct_by_program
 from metamodels_for_rasp.experiments import common
 
-from decompile_tracr.dataset import dataloading
-from decompile_tracr.dataset.config import load_config
+from rasp_gen.dataset import dataloading
+from rasp_gen.dataset.config import load_config
 
 
 #jax.config.update("jax_disable_jit", True)

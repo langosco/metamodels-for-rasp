@@ -20,9 +20,9 @@ from metamodels_for_rasp.logger_config import setup_logger, setup_data_logger
 from metamodels_for_rasp.model import Transformer, TransformerConfig
 from metamodels_for_rasp.utils import count_params, data_iterator, color_sequence, create_loss_fn, compute_fracs_correct_by_program
 
-from decompile_tracr.dataset import config as dataset_config
-from decompile_tracr.dataset import data_utils
-from decompile_tracr.tokenizing import vocab
+from rasp_gen.dataset import config as dataset_config
+from rasp_gen.dataset import data_utils
+from rasp_gen.tokenizing import vocab
 
 
 logger = setup_logger(__name__)
