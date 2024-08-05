@@ -105,8 +105,12 @@ def get_dataloaders(
     with h5py.File(config.paths.dataset, "r") as f:
         for_stats = {k: v[:5000] for k, v in f["train"].items()}
 
-    assert for_stats['weights'].shape == (5000, config.max_weights_length), (
-        f"Expected shape (5000, {config.max_weights_length}) based on config, "
+    if not len(for_stats['weights']) == 5000:
+        raise ValueError("Expected at least 5000 elements in training dataset, "
+                         f"but got only {len(for_stats['weights'])}.")
+
+    assert for_stats['weights'].shape[1] == config.max_weights_length, (
+        f"Expected shape (n, {config.max_weights_length}) based on config, "
         f"instead got {for_stats['weights'].shape}."
     )
 
@@ -223,7 +227,7 @@ def init(
             "slurm_job_id": os.environ.get('SLURM_JOB_ID'),
             "slurm_job_name": os.environ.get('SLURM_JOB_NAME'),
             "save_checkpoint": args.save_checkpoint,
-            "dataset": "nsops=10",
+            "dataset": args.data_config.name,
         },
     )
     return model, updater, state, run
